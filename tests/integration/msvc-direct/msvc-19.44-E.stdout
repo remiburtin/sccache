@@ -1,0 +1,9 @@
+#line 1 "main.cpp"
+#line 1 "D:\\a\\sccache\\sccache\\evidence\\server\\value.h"
+
+#line 2 "main.cpp"
+
+int value()
+{
+    return 42;
+}

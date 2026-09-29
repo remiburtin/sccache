@@ -53,10 +53,11 @@ def main():
         SCCACHE_SERVER_PORT=str(port),
         SCCACHE_DIRECT="1",
         SCCACHE_CLIENT_SIDE="1" if args.client_side else "0",
-        SCCACHE_LOG="sccache=debug",
     )
     server_log = work / "server.log"
     if not args.client_side:
+        # This checkout disables client-side mode whenever SCCACHE_LOG is set.
+        env["SCCACHE_LOG"] = "sccache=debug"
         env["SCCACHE_ERROR_LOG"] = str(server_log)
 
     def run(label, command):
@@ -99,12 +100,13 @@ def main():
             entries = list((work / "cache" / "preprocessor").rglob("*"))
             report.append({
                 "stage": label,
+                "mode": "client" if args.client_side else "server",
                 "seconds": elapsed,
-                "preprocessor_commands": sum(
+                "preprocessor_commands": None if args.client_side else sum(
                     b"sccache::compiler::msvc" in line and b"preprocess: " in line
                     for line in log.splitlines()
                 ),
-                "direct_hits": log.count(b"Preprocessor cache hit:"),
+                "direct_hits": None if args.client_side else log.count(b"Preprocessor cache hit:"),
                 "entries": sum(path.is_file() for path in entries),
                 "object_hits": sum(stats["cache_hits"]["counts"].values()),
                 "object_misses": sum(stats["cache_misses"]["counts"].values()),
@@ -117,8 +119,9 @@ def main():
     direct = args.expect == "direct"
     for index, row in enumerate(report):
         warm = index % 2 == 1
-        require(row["preprocessor_commands"] == int(not (direct and warm)), str(row))
-        require(row["direct_hits"] == int(direct and warm), str(row))
+        if not args.client_side:
+            require(row["preprocessor_commands"] == int(not (direct and warm)), str(row))
+            require(row["direct_hits"] == int(direct and warm), str(row))
         require((row["entries"] > 0) == direct, str(row))
         require(row["object_hits"] == (index + 1) // 2, str(row))
         require(row["object_misses"] == index // 2 + 1, str(row))

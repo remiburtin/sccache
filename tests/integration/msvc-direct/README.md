@@ -31,12 +31,32 @@ The workflow also supports manual dispatch once it exists on the default branch.
 
 After implementing the feature, run with `--expect direct`. Warm builds must
 log a direct hit and no MSVC preprocessing command. Repeat with `--client-side`
-to exercise the client pipeline; this mode captures stderr instead of setting
-`SCCACHE_ERROR_LOG`, which would disable client-side mode.
+to exercise the client pipeline. This checkout disables client-side mode when
+`SCCACHE_LOG` is present, so the client experiment leaves logging unset and
+reports `null` for preprocessing-command and direct-hit counts. It checks cache
+entries, object-cache statistics, restoration and header invalidation; it does
+not prove preprocessing was skipped. The server experiment provides log-based
+preprocessing counts.
 
-The baseline expectation is a hypothesis, not a recorded Windows result.
-This fixture has not yet been executed with native MSVC. It is a first
-experiment, not the full correctness or performance matrix.
+## Native baseline results
+
+[Run 36524996678](https://github.com/remiburtin/sccache/actions/runs/36524996678)
+tested commit `33fe4cf` on Windows Server 2022 with MSVC `19.44.35229.0`.
+The server experiment passed: all four builds ran preprocessing, both warm
+builds hit the object cache, and no preprocessor-cache entries were written.
+Changing `VALUE` from 42 to 43 produced a cache miss and a different object.
+
+The captured `/E` output includes the header's absolute path with escaped
+backslashes; `/EP` has no line markers. `msvc-19.44-E.stdout` and
+`msvc-19.44-EP.stdout` preserve those captures byte for byte, including CRLF.
+The parser tests in `src/compiler/c.rs` use these captures; the `/E` test runs
+on Windows because it checks Windows filesystem path semantics.
+
+That run's client step failed its log-count assertion: setting `SCCACHE_LOG`
+had silently selected server-side execution. Those results do not validate
+client-side mode. The reproducer now removes logging for client-side runs as
+described above. This remains a first experiment, not the full correctness or
+performance matrix.
 
 ## Investigation checkpoint
 
@@ -72,7 +92,7 @@ At that revision:
   it reads the platform default cache directory, ignoring the custom
   `SCCACHE_DIR`; this experiment counts entries in its isolated cache directly.
 
-Production code is unchanged pending the requested native MSVC experiment.
+Production code is unchanged after the baseline experiment.
 Do not treat the `/EP` to `/E` switch alone as a complete correctness fix.
 
 References:

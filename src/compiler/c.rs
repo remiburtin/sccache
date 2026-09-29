@@ -2014,6 +2014,76 @@ int value;
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn test_process_preprocessed_file_msvc_e() {
+        let cwd = Path::new(r"D:\a\sccache\sccache\evidence\server");
+        let header = cwd.join("value.h");
+        let contents = &include_bytes!("../../tests/integration/msvc-direct/value.h")[..];
+        let fs_impl = TestFs {
+            metadata_results: Mutex::new(
+                [(
+                    header.clone(),
+                    PreprocessorFileMetadata {
+                        is_dir: false,
+                        is_file: true,
+                        modified: Some(Timestamp::new(12341234, 0)),
+                        ctime_or_creation: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            open_results: Mutex::new(
+                [(header.clone(), Box::new(contents) as Box<dyn std::io::Read>)]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let original = include_bytes!("../../tests/integration/msvc-direct/msvc-19.44-E.stdout");
+        let mut bytes = original.to_vec();
+        let mut include_files = HashMap::new();
+        assert!(
+            process_preprocessed_file(
+                &cwd.join("main.cpp"),
+                cwd,
+                &mut bytes,
+                &mut include_files,
+                PreprocessorCacheModeConfig::activated(),
+                std::time::SystemTime::now(),
+                fs_impl,
+            )
+            .unwrap()
+        );
+        assert_eq!(&bytes, original);
+        assert_eq!(include_files.len(), 1);
+        assert_eq!(
+            include_files[&header],
+            Digest::reader_sync(contents).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_process_preprocessed_file_msvc_ep() {
+        let original = include_bytes!("../../tests/integration/msvc-direct/msvc-19.44-EP.stdout");
+        let mut bytes = original.to_vec();
+        let mut include_files = HashMap::new();
+        assert!(
+            process_preprocessed_file(
+                Path::new("main.cpp"),
+                Path::new(""),
+                &mut bytes,
+                &mut include_files,
+                PreprocessorCacheModeConfig::activated(),
+                std::time::SystemTime::now(),
+                PanicFs,
+            )
+            .unwrap()
+        );
+        assert_eq!(&bytes, original);
+        assert!(include_files.is_empty());
+    }
+
     /// A filesystem interface that only panics to test that we don't access it.
     struct PanicFs;
 
