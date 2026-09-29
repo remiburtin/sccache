@@ -456,6 +456,12 @@ where
             );
             false
         };
+        // Manifests currently retain absolute header paths. A relocated MSVC
+        // checkout must not validate headers from the original checkout.
+        let use_preprocessor_cache_mode = use_preprocessor_cache_mode
+            && (self.compiler.kind() != CCompilerKind::Msvc
+                || (storage.basedirs().is_empty()
+                    && super::msvc::direct_mode_file_is_safe(&absolute_input_path)));
 
         let mut preprocessor_key = if use_preprocessor_cache_mode {
             preprocessor_cache_entry_hash_key(
@@ -610,6 +616,15 @@ where
                     debug!("Disabling preprocessor cache mode");
                     preprocessor_key = None;
                 }
+                // #import also depends on a type library, which line markers
+                // do not describe. Check transitive headers before storing an entry.
+                if self.compiler.kind() == CCompilerKind::Msvc
+                    && !include_files
+                        .keys()
+                        .all(|path| super::msvc::direct_mode_file_is_safe(path))
+                {
+                    preprocessor_key = None;
+                }
             }
 
             trace!(
@@ -631,6 +646,10 @@ where
         // use in creating a hash key
         let mut common_and_arch_args = self.parsed_args.common_args.clone();
         common_and_arch_args.extend(self.parsed_args.arch_args.clone());
+        if self.compiler.kind() == CCompilerKind::Msvc {
+            // /showIncludes changes the cached compiler output streams.
+            common_and_arch_args.extend(self.parsed_args.dependency_args.clone());
+        }
 
         let key = HashKeyParams::new(
             &self.executable_digest,
@@ -1627,6 +1646,154 @@ mod test {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    fn test_msvc_direct_cache_pipeline() {
+        use crate::cache::{CacheMode, disk::DiskCache};
+        use crate::compiler::msvc::Msvc;
+        use crate::mock_command::{MockChild, exit_status};
+        use crate::test::utils::{new_creator, next_command_calls};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut ordinary_key = None;
+        for (source, header, flags, basedirs, direct) in [
+            (
+                "#include \"value.h\"\n",
+                "#define VALUE 42\n",
+                ovec![],
+                false,
+                true,
+            ),
+            (
+                "#include \"value.h\"\n__DATE__\n",
+                "#define VALUE 42\n",
+                ovec![],
+                false,
+                false,
+            ),
+            (
+                "#import \"value.tlb\"\n",
+                "#define VALUE 42\n",
+                ovec![],
+                false,
+                false,
+            ),
+            (
+                "#include \"value.h\"\n",
+                "#import \"value.tlb\"\n",
+                ovec![],
+                false,
+                false,
+            ),
+            (
+                "#include \"value.h\"\n",
+                "#define VALUE 42\n",
+                ovec!["/sourceDependencies", "deps.json"],
+                false,
+                false,
+            ),
+            (
+                "#include \"value.h\"\n",
+                "#define VALUE 42\n",
+                ovec!["/showIncludes"],
+                false,
+                false,
+            ),
+            (
+                "#include \"value.h\"\n",
+                "#define VALUE 42\n",
+                ovec![],
+                true,
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path();
+            fs::write(cwd.join("main.c"), source).unwrap();
+            fs::write(cwd.join("value.h"), header).unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
+                cwd.join("cache"),
+                1024 * 1024,
+                runtime.handle(),
+                PreprocessorCacheModeConfig::activated(),
+                CacheMode::ReadWrite,
+                if basedirs {
+                    vec![cwd.as_os_str().as_encoded_bytes().to_vec()]
+                } else {
+                    vec![]
+                },
+            ));
+            let compiler = Msvc {
+                includes_prefix: "Note: including file: ".into(),
+                is_clang: false,
+                version: None,
+            };
+            let mut args = ovec!["/c", "main.c"];
+            args.extend(flags);
+            let CompilerArguments::Ok(parsed_args) = compiler.parse_arguments(&args, cwd, &[])
+            else {
+                panic!("failed to parse {args:?}");
+            };
+            let mut hasher = CCompilerHasher {
+                parsed_args,
+                executable: "cl.exe".into(),
+                executable_digest: "compiler".into(),
+                compiler,
+            };
+            let creator = new_creator();
+            let mut keys = Vec::new();
+            for index in 0..4 {
+                if index == 2 {
+                    fs::write(
+                        cwd.join("value.h"),
+                        format!("{header}\n#define CHANGED 43\n"),
+                    )
+                    .unwrap();
+                }
+                if !direct || index % 2 == 0 {
+                    next_command_calls(&creator, move |args| {
+                        assert!(args.iter().any(|arg| arg == "-E" || arg == "-EP"));
+                        Ok(MockChild::new(
+                            exit_status(0),
+                            format!(
+                                "#line 1 \"value.h\"\nint value = {};\n",
+                                if index < 2 { 42 } else { 43 }
+                            ),
+                            "",
+                        ))
+                    });
+                }
+                // Do not queue a process for direct hits: any preprocessing panics.
+                keys.push(
+                    runtime
+                        .block_on(hasher.generate_hash_key(
+                            &creator,
+                            cwd.to_owned(),
+                            vec![],
+                            false,
+                            runtime.handle(),
+                            false,
+                            storage.clone(),
+                            CacheControl::Default,
+                        ))
+                        .unwrap()
+                        .key,
+                );
+                assert!(creator.lock().unwrap().children.is_empty());
+            }
+            assert_eq!(keys[0], keys[1]);
+            assert_eq!(keys[2], keys[3]);
+            assert_ne!(keys[0], keys[2]);
+            if direct {
+                ordinary_key = Some(keys[0].clone());
+            } else if hasher.parsed_args.msvc_show_includes {
+                assert_ne!(ordinary_key.as_ref().unwrap(), &keys[0]);
+            }
+        }
+    }
 
     #[test]
     fn test_same_content() {

@@ -42,7 +42,7 @@ use super::c::hash_arguments;
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 
@@ -369,6 +369,7 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
         "CPLUS_INCLUDE_PATH",
         "OBJC_INCLUDE_PATH",
         "OBJCPLUS_INCLUDE_PATH",
+        "INCLUDE",
     ]
     .iter()
     .map(OsStr::new)
@@ -409,6 +410,8 @@ pub fn preprocessor_cache_entry_hash_key(
     }
 
     for (var, val) in env_vars.iter() {
+        #[cfg(windows)]
+        let var = &OsString::from(var.to_string_lossy().to_ascii_uppercase());
         if CACHED_ENV_VARS.contains(var.as_os_str()) {
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(&b"="[..]);
@@ -436,9 +439,9 @@ pub fn preprocessor_cache_entry_hash_key(
         Digest::reader_sync(reader)?
     } else {
         let (digest, finder) = Digest::reader_sync_time_macros(reader)?;
-        if finder.found_time() {
+        if finder.found_time_macros() {
             // Disable preprocessor cache mode
-            debug!("Found __TIME__ in {}", input_file.display());
+            debug!("Found time macros in {}", input_file.display());
             return Ok(None);
         }
         digest
@@ -501,6 +504,64 @@ mod test {
     use crate::util::{HASH_BUFFER_SIZE, MAX_TIME_MACRO_HAYSTACK_LEN};
 
     use super::*;
+
+    #[test]
+    fn test_direct_key_include_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.c");
+        std::fs::write(&path, "int value;\n").unwrap();
+        let hash = |env: &[(OsString, OsString)]| {
+            preprocessor_cache_entry_hash_key(
+                "compiler",
+                Language::C,
+                &[],
+                &[],
+                None,
+                env,
+                &path,
+                false,
+                PreprocessorCacheModeConfig::activated(),
+                &[],
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = hash(&[("INCLUDE".into(), "C:\\first".into())]);
+        let second = hash(&[("INCLUDE".into(), "C:\\second".into())]);
+        assert_ne!(first, second);
+        assert_ne!(first, hash(&[]));
+        #[cfg(windows)]
+        assert_eq!(first, hash(&[("Include".into(), "C:\\first".into())]));
+    }
+
+    #[test]
+    fn test_direct_key_source_time_macros() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.c");
+        for token in ["__TIME__", "__DATE__", "__TIMESTAMP__"] {
+            std::fs::write(&path, format!("const char *s = {token};\n")).unwrap();
+            for ignore_time_macros in [false, true] {
+                let config = PreprocessorCacheModeConfig {
+                    ignore_time_macros,
+                    ..PreprocessorCacheModeConfig::activated()
+                };
+                let key = preprocessor_cache_entry_hash_key(
+                    "compiler",
+                    Language::C,
+                    &[],
+                    &[],
+                    None,
+                    &[],
+                    &path,
+                    false,
+                    config,
+                    &[],
+                )
+                .unwrap();
+                assert_eq!(key.is_some(), ignore_time_macros, "{token}");
+            }
+        }
+    }
 
     #[test]
     fn test_find_time_macros_empty_file() {

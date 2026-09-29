@@ -59,8 +59,17 @@ impl CCompilerImpl for Msvc {
         &self,
         arguments: &[OsString],
         cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<ParsedArguments> {
+        // These options can hide outputs, response files, PCHs and modules from
+        // argument parsing. Hashing the strings alone would not track their inputs.
+        if env_vars.iter().any(|(key, value)| {
+            !value.is_empty()
+                && (key.to_string_lossy().eq_ignore_ascii_case("CL")
+                    || key.to_string_lossy().eq_ignore_ascii_case("_CL_"))
+        }) {
+            return CompilerArguments::CannotCache("CL/_CL_ environment options", None);
+        }
         parse_arguments(arguments, cwd, self.is_clang)
     }
 
@@ -74,7 +83,7 @@ impl CCompilerImpl for Msvc {
         env_vars: &[(OsString, OsString)],
         may_dist: bool,
         rewrite_includes_only: bool,
-        _preprocessor_cache_mode: bool,
+        preprocessor_cache_mode: bool,
     ) -> Result<process::Output>
     where
         T: CommandCreatorSync,
@@ -89,6 +98,7 @@ impl CCompilerImpl for Msvc {
             &self.includes_prefix,
             rewrite_includes_only,
             self.is_clang,
+            preprocessor_cache_mode,
         )
         .await
     }
@@ -115,6 +125,31 @@ impl CCompilerImpl for Msvc {
             },
         )
     }
+}
+
+pub(super) fn direct_mode_file_is_safe(path: &Path) -> bool {
+    let Ok(mut bytes) = fs::read(path) else {
+        return false;
+    };
+    // UTF-16 would hide tokens from byte scanning. Removing line splices also
+    // catches split directive names; false positives only cost a direct hit.
+    if bytes.contains(&0) {
+        return false;
+    }
+    bytes.retain(|byte| !matches!(byte, b'\\' | b'\r' | b'\n'));
+    let identifier_byte = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    !bytes.windows(b"import".len()).enumerate().any(|(i, s)| {
+        s == b"import"
+            && (i == 0 || !identifier_byte(&bytes[i - 1]))
+            && !bytes.get(i + s.len()).is_some_and(identifier_byte)
+    }) && !bytes.windows(b"??/".len()).any(|s| s == b"??/")
+        && !has_time_macros(&bytes)
+}
+
+fn has_time_macros(bytes: &[u8]) -> bool {
+    [b"__TIME__".as_slice(), b"__DATE__", b"__TIMESTAMP__"]
+        .iter()
+        .any(|token| bytes.windows(token.len()).any(|s| s == *token))
 }
 
 #[cfg(not(windows))]
@@ -913,6 +948,24 @@ pub fn parse_arguments(
         };
     }
 
+    // Dependency files are emitted during preprocessing, not restored from the
+    // object cache. Keep clang-cl separate until its line markers are validated.
+    let too_hard_for_preprocessor_cache_mode = if is_clang {
+        Some("clang-cl".into())
+    } else if depfile.is_some() {
+        Some("/sourceDependencies".into())
+    } else if show_includes {
+        Some("/showIncludes".into())
+    } else if preprocessor_args
+        .iter()
+        .chain(&common_args)
+        .any(|arg| has_time_macros(arg.as_encoded_bytes()))
+    {
+        Some("time macros".into())
+    } else {
+        None
+    };
+
     CompilerArguments::Ok(ParsedArguments {
         input: input.into(),
         double_dash_input,
@@ -933,7 +986,7 @@ pub fn parse_arguments(
         // FIXME: implement color_mode for msvc.
         color_mode: ColorMode::Auto,
         suppress_rewrite_includes_only: false,
-        too_hard_for_preprocessor_cache_mode: None,
+        too_hard_for_preprocessor_cache_mode,
     })
 }
 
@@ -981,6 +1034,7 @@ pub fn preprocess_cmd<T>(
     may_dist: bool,
     rewrite_includes_only: bool,
     is_clang: bool,
+    preprocessor_cache_mode: bool,
 ) where
     T: RunCommand,
 {
@@ -988,9 +1042,10 @@ pub fn preprocess_cmd<T>(
     // reporting and to not cause spurious compilation failure (e.g. no exceptions build
     // fails due to exceptions transitively included in the stdlib).
     // With -fprofile-generate line number information is important, so use -E.
+    // Native direct mode needs line markers to discover included files.
     // Otherwise, use -EP to maximize cache hits (because no absolute file paths are
     // emitted) and improve performance.
-    if may_dist || parsed_args.profile_generate {
+    if may_dist || parsed_args.profile_generate || (preprocessor_cache_mode && !is_clang) {
         cmd.arg("-E");
     } else {
         cmd.arg("-EP");
@@ -1041,6 +1096,7 @@ pub async fn preprocess<T>(
     includes_prefix: &str,
     rewrite_includes_only: bool,
     is_clang: bool,
+    preprocessor_cache_mode: bool,
 ) -> Result<process::Output>
 where
     T: CommandCreatorSync,
@@ -1054,6 +1110,7 @@ where
         may_dist,
         rewrite_includes_only,
         is_clang,
+        preprocessor_cache_mode,
     );
 
     if log_enabled!(Debug) {
@@ -1479,6 +1536,133 @@ mod test {
 
     fn parse_arguments_clang(arguments: Vec<OsString>) -> CompilerArguments<ParsedArguments> {
         super::parse_arguments(&arguments, &std::env::current_dir().unwrap(), true)
+    }
+
+    #[test]
+    fn test_preprocess_direct_mode() {
+        for is_clang in [false, true] {
+            for direct in [false, true] {
+                for may_dist in [false, true] {
+                    let CompilerArguments::Ok(parsed) = super::parse_arguments(
+                        &["/c".into(), "foo.c".into()],
+                        Path::new(""),
+                        is_clang,
+                    ) else {
+                        panic!("failed to parse arguments");
+                    };
+                    let mut cmd = MockCommand {
+                        child: None,
+                        args: vec![],
+                    };
+                    preprocess_cmd(
+                        &mut cmd,
+                        &parsed,
+                        Path::new(""),
+                        &[],
+                        may_dist,
+                        false,
+                        is_clang,
+                        direct,
+                    );
+                    assert_eq!(
+                        cmd.args[0],
+                        if may_dist || (direct && !is_clang) {
+                            "-E"
+                        } else {
+                            "-EP"
+                        }
+                    );
+                    assert_eq!(cmd.args.last().unwrap(), "foo.c");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_mode_fallbacks() {
+        for (flags, reason) in [
+            (ovec![], None),
+            (ovec!["/FIforced.h"], None),
+            (
+                ovec!["/sourceDependencies", "foo.json"],
+                Some("/sourceDependencies"),
+            ),
+            (ovec!["/showIncludes"], Some("/showIncludes")),
+            (ovec!["/DWHEN=__DATE__"], Some("time macros")),
+            (ovec!["/DWHEN=__TIME__"], Some("time macros")),
+            (ovec!["/DWHEN=__TIMESTAMP__"], Some("time macros")),
+        ] {
+            let mut args = ovec!["/c", "foo.c"];
+            args.extend(flags);
+            let CompilerArguments::Ok(parsed) = parse_arguments(args.clone()) else {
+                panic!("failed to parse {args:?}");
+            };
+            assert_eq!(
+                parsed.too_hard_for_preprocessor_cache_mode,
+                reason.map(OsString::from)
+            );
+            let CompilerArguments::Ok(parsed) = parse_arguments_clang(args) else {
+                panic!("failed to parse clang-cl arguments");
+            };
+            assert_eq!(
+                parsed.too_hard_for_preprocessor_cache_mode,
+                Some("clang-cl".into())
+            );
+        }
+    }
+
+    #[test]
+    fn test_environment_options_cannot_cache() {
+        for is_clang in [false, true] {
+            let compiler = Msvc {
+                includes_prefix: String::new(),
+                is_clang,
+                version: None,
+            };
+            for key in ["CL", "_CL_", "cl", "_cl_"] {
+                let args = ovec!["/c", "foo.c"];
+                assert_eq!(
+                    compiler.parse_arguments(
+                        &args,
+                        Path::new(""),
+                        &[(key.into(), "/Yupch.h".into())]
+                    ),
+                    CompilerArguments::CannotCache("CL/_CL_ environment options", None)
+                );
+                assert!(matches!(
+                    compiler.parse_arguments(&args, Path::new(""), &[(key.into(), "".into())]),
+                    CompilerArguments::Ok(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_mode_file_safety() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.cpp");
+        assert!(!direct_mode_file_is_safe(&path));
+        for contents in [
+            b"#import \"test.tlb\"".as_slice(),
+            b"# /*comment*/ import \"test.tlb\"",
+            b"#im\\\nport \"test.tlb\"",
+            b"#im\\\r\nport \"test.tlb\"",
+            b"#im??/\nport \"test.tlb\"",
+            b"\xff\xfe#\0i\0m\0p\0o\0r\0t\0",
+            b"const char *s = __TIME__;",
+            b"const char *s = __DATE__;",
+            b"const char *s = __TIMESTAMP__;",
+            b"const char *s = __TI\\\nME__;",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(!direct_mode_file_is_safe(&path), "{contents:?}");
+        }
+        fs::write(
+            &path,
+            b"#include \"value.h\"\n__declspec(dllimport) int value();\n",
+        )
+        .unwrap();
+        assert!(direct_mode_file_is_safe(&path));
     }
 
     #[test]
@@ -3061,7 +3245,16 @@ mod test {
             child: None,
             args: vec![],
         };
-        preprocess_cmd(&mut cmd, &parsed_args, Path::new(""), &[], true, true, true);
+        preprocess_cmd(
+            &mut cmd,
+            &parsed_args,
+            Path::new(""),
+            &[],
+            true,
+            true,
+            true,
+            false,
+        );
         let expected_args = ovec!["-E", "-nologo", "-clang:-frewrite-includes", "--", "foo.c"];
         assert_eq!(cmd.args, expected_args);
     }

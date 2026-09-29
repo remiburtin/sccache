@@ -22,14 +22,14 @@ Use `--output-dir PATH` to select a new evidence directory, for example when
 collecting CI artifacts. Existing directories are rejected to avoid cache reuse.
 
 The [MSVC direct-cache workflow](../../../.github/workflows/msvc-direct.yml)
-runs this baseline on `windows-2022`, in both server and client-side modes, when
+runs with `--expect direct` on `windows-2022`, in both server and client-side modes, when
 the experiment or compiler code is pushed to `feature/msvc-preprocessor`.
 It builds with local storage only and uploads `msvc-direct-evidence`, including
 raw `/E` and `/EP` output, per-build logs, statistics and compiler version.
 Artifacts are uploaded on failure too, so unexpected behavior can be inspected.
 The workflow also supports manual dispatch once it exists on the default branch.
 
-After implementing the feature, run with `--expect direct`. Warm builds must
+Run with `--expect direct`. Warm builds must
 log a direct hit and no MSVC preprocessing command. Repeat with `--client-side`
 to exercise the client pipeline. This checkout disables client-side mode when
 `SCCACHE_LOG` is present, so the client experiment leaves logging unset and
@@ -92,13 +92,70 @@ At that revision:
   it reads the platform default cache directory, ignoring the custom
   `SCCACHE_DIR`; this experiment counts entries in its isolated cache directly.
 
-Production code is unchanged after the baseline experiment.
-Do not treat the `/EP` to `/E` switch alone as a complete correctness fix.
+## Implementation under test
+
+The native MSVC path now propagates the direct-mode flag and uses `/E` when it
+needs line markers. Clang-cl stays on its existing preprocessing path and is
+explicitly excluded from direct hits, including distributed/profile invocations
+that happen to emit line markers.
+
+`INCLUDE` is part of the direct key (case-insensitive environment names on
+Windows). Nonempty `CL` or `_CL_` bypass caching entirely: merely hashing these
+strings cannot account for hidden response files, PCH/module inputs or outputs.
+`/sourceDependencies` and `/showIncludes` continue to preprocess each time;
+the former's JSON is not a cached artifact. `/showIncludes` also distinguishes
+object-cache keys so a cached compilation without include output cannot answer
+a request that needs it. Existing PCH/module rejection remains in place.
+
+Source time macros now disable the generic direct key unless explicitly ignored.
+For MSVC, source/header scans additionally reject time macros, potential `import`
+tokens, trigraph splices and UTF-16 content, including when time macros are
+configured to be ignored. This deliberately allows false positives. It handles
+imports in transitive headers before storing a manifest; it does not implement
+type-library dependency tracking. MSVC direct hits are also disabled when
+basedirs are configured, since manifests still store absolute header paths and
+cannot safely be shared between relocated checkouts.
+
+`correctness.py` runs a separate server-mode matrix against uncached compiler
+invocations. It checks `/D` and `/U`, `/FI` header changes, `INCLUDE` search-path
+changes, `CL` and `_CL_` fallback, absolute Windows paths with spaces, basedir
+relocation with the old tree still present, toggling `/showIncludes` against the
+same cache, and deletion/regeneration of `/sourceDependencies` JSON. It also
+checks conservative source/header time-macro and inactive `#import` fallbacks,
+and runs clang-cl separately. It compares restored objects with native compiler
+output except for `__TIME__` cases, where the clock can change between commands.
+The inactive imports test conservative detection without requiring a type library;
+they do not validate real COM-generated artifacts. Unicode and UNC path coverage
+remain follow-up work.
+
+The workflow now requires the four-stage direct-hit sequence and this matrix.
+These assertions have not yet been demonstrated on Windows for this change;
+the previous passing runs describe only the baseline. Keep `docs/Local.md`
+unchanged until the native workflow passes.
+
+Local validation on macOS with Rust 1.98.1 passed `cargo fmt -- --check`, the
+`AGENTS.md` clippy command, and `cargo test --locked --lib --bins --tests`
+(558 passed, one ignored OAuth test; CUDA cases skipped without a compiler).
+The full suite required execution outside the sandbox for local sockets and
+system access. The local-storage-only MSVC tests and mocked direct-cache
+pipeline also passed. Python scripts passed syntax compilation. MSRV 1.91 and
+native Windows validation remain for the workflow; this machine has no MSVC
+and its GitHub CLI is not authenticated to launch a run.
+
+## Correctness scope
+
+Shadow-header probes remain separate work. This implementation tracks files
+that were actually included. Creating a previously absent header earlier on an
+unchanged include search path can still return a stale direct hit, as documented
+for generic direct mode. The `INCLUDE` test changes the search-path string; it
+does not close this gap. This patch therefore does **not** establish the full
+invariant that every change to a compiler-visible input invalidates direct hits.
 
 References:
 
 - [Microsoft `/E` documentation](https://learn.microsoft.com/en-us/cpp/build/reference/e-preprocess-to-stdout)
 - [Microsoft `/EP` documentation](https://learn.microsoft.com/en-us/cpp/build/reference/ep-preprocess-to-stdout-without-hash-line-directives)
+- [Microsoft environment option syntax](https://learn.microsoft.com/en-us/cpp/build/reference/cl-environment-variables)
 - [Upstream direct-mode RFC #2766](https://github.com/mozilla/sccache/issues/2766)
 
 The RFC proposes generic shadow-header probes. This checkout still uses the
