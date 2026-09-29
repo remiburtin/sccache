@@ -129,18 +129,23 @@ they do not validate real COM-generated artifacts. Unicode and UNC path coverage
 remain follow-up work.
 
 The workflow now requires the four-stage direct-hit sequence and this matrix.
-These assertions have not yet been demonstrated on Windows for this change;
-the previous passing runs describe only the baseline. Keep `docs/Local.md`
-unchanged until the native workflow passes.
+[Windows run 36622804614](https://github.com/remiburtin/sccache/actions/runs/36622804614)
+passed on commit `b6ee6f1` with Rust 1.91.0 and MSVC 19.44.35229.0. The
+server report records one preprocessing command on the cold build, a direct hit
+with no preprocessing on the warm build, one preprocessing command and an object
+miss after the header edit, then another direct hit with no preprocessing.
+The client report records one preprocessor-cache entry, object restoration and
+header invalidation; it cannot count preprocessing commands because logging is
+disabled in client-side mode. All 16 matrix reports show the expected direct
+hits or conservative fallbacks, and the workflow step passed its native object
+comparisons. The evidence artifact is available from the linked run.
 
 Local validation on macOS with Rust 1.98.1 passed `cargo fmt -- --check`, the
 `AGENTS.md` clippy command, and `cargo test --locked --lib --bins --tests`
 (558 passed, one ignored OAuth test; CUDA cases skipped without a compiler).
 The full suite required execution outside the sandbox for local sockets and
 system access. The local-storage-only MSVC tests and mocked direct-cache
-pipeline also passed. Python scripts passed syntax compilation. MSRV 1.91 and
-native Windows validation remain for the workflow; this machine has no MSVC
-and its GitHub CLI is not authenticated to launch a run.
+pipeline also passed. Python scripts passed syntax compilation.
 
 ## Correctness scope
 

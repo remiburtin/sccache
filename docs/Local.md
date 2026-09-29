@@ -23,12 +23,19 @@ Preprocessor cache mode will be disabled in any of the following cases:
 
 - Not compiling C or C++
 - The configuration option is false
-- Not using GCC or Clang
+- Not using GCC, Clang, or native MSVC (`cl.exe`)
 - Not using local storage for the cache
 - Any of the compiler options `-MP`, `-Xpreprocessor`, `-Wp,` are present
 - The modification time of one of the header files is too new (avoids a race condition)
 - Certain strings such as `__DATE__`, `__TIME__`, `__TIMESTAMP__` are present in the source code,
   indicating that the preprocessor result may change based on external factors
+
+Native MSVC uses `/E` line markers to track included headers. It falls back to
+preprocessing for `/showIncludes`, `/sourceDependencies`, `SCCACHE_BASEDIRS`,
+potential `#import` use, and source or header time macros. A nonempty `CL` or
+`_CL_` environment variable bypasses compilation caching because its options
+can hide inputs or outputs; changes to `INCLUDE` invalidate the direct entry.
+Clang-cl does not use preprocessor cache mode.
 
 The preprocessor cache may silently produce stale results in any of the following cases:
 
@@ -36,6 +43,10 @@ The preprocessor cache may silently produce stale results in any of the followin
   not exist at the time. sccache does not know about such files, so it cannot invalidate the result if the header file later exists.
 - A macro such as `__TIME__` (etc) is used in the source code and `ignore_time_macros` is enabled
 - There are other external factors influencing the preprocessing result that sccache does not know about
+
+Native MSVC rejects time macros even when `ignore_time_macros` is enabled. The
+missing-header case above also applies to MSVC: creating a previously absent
+header on an unchanged include search path can leave a stale direct entry.
 
 Configuration options and their default values:
 
