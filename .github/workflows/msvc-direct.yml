@@ -1,0 +1,69 @@
+name: MSVC direct-cache experiment
+
+on:
+  push:
+    branches: [feature/msvc-preprocessor]
+    paths:
+      - .github/workflows/msvc-direct.yml
+      - tests/integration/msvc-direct/**
+      - src/compiler/**
+  workflow_dispatch:
+    inputs:
+      expectation:
+        description: Expected preprocessor-cache behavior
+        type: choice
+        options: [baseline, direct]
+        default: baseline
+
+permissions:
+  contents: read
+
+jobs:
+  native-msvc:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      EXPECTATION: ${{ inputs.expectation || 'baseline' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Rust
+        uses: ./.github/actions/rust-toolchain
+        with:
+          toolchain: "1.91.0"
+
+      - name: Record toolchain
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path evidence
+          git rev-parse HEAD | Out-File evidence/toolchain.txt
+          rustc --version | Out-File -Append evidence/toolchain.txt
+          python --version | Out-File -Append evidence/toolchain.txt
+          (Get-Command cl.exe).Source | Out-File -Append evidence/toolchain.txt
+          Get-Item (Get-Command cl.exe).Source | Select-Object -ExpandProperty VersionInfo | Format-List | Out-File -Append evidence/toolchain.txt
+
+      - name: Build sccache with local storage
+        id: build
+        run: cargo build --locked --no-default-features --bin sccache
+
+      - name: Evaluate server-side mode
+        run: python tests/integration/msvc-direct/reproduce.py target/debug/sccache.exe --expect $env:EXPECTATION --output-dir evidence/server
+
+      - name: Evaluate client-side mode
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python tests/integration/msvc-direct/reproduce.py target/debug/sccache.exe --expect $env:EXPECTATION --client-side --output-dir evidence/client
+
+      - name: Upload compiler output, logs and cache statistics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: msvc-direct-evidence
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14

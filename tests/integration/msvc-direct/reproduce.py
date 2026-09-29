@@ -22,12 +22,17 @@ def main():
     parser.add_argument("sccache", type=Path)
     parser.add_argument("--expect", choices=("baseline", "direct"), required=True)
     parser.add_argument("--client-side", action="store_true")
+    parser.add_argument("--output-dir", type=Path, help="New directory for captured evidence")
     args = parser.parse_args()
     require(os.name == "nt", "Run in a Windows MSVC Developer Command Prompt.")
     compiler = shutil.which("cl.exe")
     require(compiler, "cl.exe must be on PATH.")
     sccache = args.sccache.resolve(strict=True)
-    work = Path(tempfile.mkdtemp(prefix="sccache-msvc-direct-"))
+    if args.output_dir:
+        work = args.output_dir.resolve()
+        work.mkdir(parents=True, exist_ok=False)
+    else:
+        work = Path(tempfile.mkdtemp(prefix="sccache-msvc-direct-"))
     print(f"Evidence directory: {work}", flush=True)
     fixture = Path(__file__).resolve().parent
     for name in ("main.cpp", "value.h"):
@@ -105,9 +110,9 @@ def main():
                 "object_misses": sum(stats["cache_misses"]["counts"].values()),
             })
     finally:
+        (work / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         if started:
             run("stop", [sccache, "--stop-server"])
-        (work / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     direct = args.expect == "direct"
     for index, row in enumerate(report):

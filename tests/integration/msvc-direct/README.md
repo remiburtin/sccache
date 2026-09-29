@@ -18,6 +18,16 @@ preprocessing command log counts, preprocessor-entry file counts and elapsed
 time. The script checks object restoration and that the header change produces
 a different object. Raw logs and command lines are retained for inspection.
 Counts refer to sccache's preprocessing command logs, not OS process tracing.
+Use `--output-dir PATH` to select a new evidence directory, for example when
+collecting CI artifacts. Existing directories are rejected to avoid cache reuse.
+
+The [MSVC direct-cache workflow](../../../.github/workflows/msvc-direct.yml)
+runs this baseline on `windows-2022`, in both server and client-side modes, when
+the experiment or compiler code is pushed to `feature/msvc-preprocessor`.
+It builds with local storage only and uploads `msvc-direct-evidence`, including
+raw `/E` and `/EP` output, per-build logs, statistics and compiler version.
+Artifacts are uploaded on failure too, so unexpected behavior can be inspected.
+The workflow also supports manual dispatch once it exists on the default branch.
 
 After implementing the feature, run with `--expect direct`. Warm builds must
 log a direct hit and no MSVC preprocessing command. Repeat with `--client-side`
