@@ -7,6 +7,8 @@ on:
       - .github/workflows/msvc-direct.yml
       - tests/integration/msvc-direct/**
       - src/compiler/**
+      - src/commands.rs
+      - src/server.rs
   workflow_dispatch:
     inputs:
       expectation:
@@ -28,6 +30,17 @@ jobs:
       EXPECTATION: ${{ inputs.expectation || 'direct' }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install Spanish compiler resources
+        if: ${{ env.EXPECTATION == 'direct' }}
+        shell: pwsh
+        run: |
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $installPath = & "$installerDir\vswhere.exe" -latest -products '*' -property installationPath
+          if (-not $installPath) { throw 'Visual Studio installation not found' }
+          $arguments = @('modify', '--installPath', "`"$installPath`"", '--addProductLang', 'es-ES', '--quiet', '--norestart')
+          $process = Start-Process -FilePath "$installerDir\setup.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) { throw "Language pack installation failed: $($process.ExitCode)" }
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:

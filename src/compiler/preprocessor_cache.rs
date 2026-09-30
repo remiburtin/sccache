@@ -370,6 +370,7 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
         "OBJC_INCLUDE_PATH",
         "OBJCPLUS_INCLUDE_PATH",
         "INCLUDE",
+        "VSLANG",
     ]
     .iter()
     .map(OsStr::new)
@@ -506,7 +507,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_direct_key_include_environment() {
+    fn test_direct_key_environment() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.c");
         std::fs::write(&path, "int value;\n").unwrap();
@@ -526,12 +527,20 @@ mod test {
             .unwrap()
             .unwrap()
         };
-        let first = hash(&[("INCLUDE".into(), "C:\\first".into())]);
-        let second = hash(&[("INCLUDE".into(), "C:\\second".into())]);
-        assert_ne!(first, second);
-        assert_ne!(first, hash(&[]));
-        #[cfg(windows)]
-        assert_eq!(first, hash(&[("Include".into(), "C:\\first".into())]));
+        for (name, first_value, second_value) in [
+            ("INCLUDE", "C:\\first", "C:\\second"),
+            ("VSLANG", "1033", "1036"),
+        ] {
+            let first = hash(&[(name.into(), first_value.into())]);
+            let second = hash(&[(name.into(), second_value.into())]);
+            assert_ne!(first, second);
+            assert_ne!(first, hash(&[]));
+            #[cfg(windows)]
+            assert_eq!(
+                first,
+                hash(&[(name.to_lowercase().into(), first_value.into())])
+            );
+        }
     }
 
     #[test]

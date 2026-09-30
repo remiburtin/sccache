@@ -55,6 +55,20 @@ impl CCompilerImpl for Msvc {
     fn version(&self) -> Option<String> {
         self.version.clone()
     }
+    fn cache_key_extra(&self) -> Option<String> {
+        // Equal compiler binaries can load different language resources. Include
+        // the encoding too, since Ninja matches the prefix as raw bytes.
+        #[cfg(windows)]
+        let encoding = unsafe {
+            (
+                windows_sys::Win32::Globalization::GetOEMCP(),
+                windows_sys::Win32::System::Console::GetConsoleOutputCP(),
+            )
+        };
+        #[cfg(not(windows))]
+        let encoding = (0, 0);
+        Some(format!("msvc-output:{encoding:?}:{}", self.includes_prefix))
+    }
     fn parse_arguments(
         &self,
         arguments: &[OsString],
@@ -238,6 +252,7 @@ where
     }
     cmd.args(&["-nologo", "-showIncludes", "-c", "-Fonul", "-I.", "-E"])
         .arg(&input)
+        .env_clear()
         .current_dir(tempdir.path());
     for (k, v) in env {
         cmd.env(k, v);
@@ -981,8 +996,13 @@ pub fn parse_arguments(
         uses_external_assembler: false,
         msvc_show_includes: show_includes,
         profile_generate,
-        // FIXME: implement color_mode for msvc.
-        color_mode: ColorMode::Auto,
+        // The ANSI filter decodes UTF-8 and would corrupt localized include
+        // prefixes in an OEM code page. Ninja needs the original bytes.
+        color_mode: if show_includes && !is_clang {
+            ColorMode::On
+        } else {
+            ColorMode::Auto
+        },
         suppress_rewrite_includes_only: false,
         too_hard_for_preprocessor_cache_mode,
     })
@@ -1572,6 +1592,31 @@ mod test {
                     );
                     assert_eq!(cmd.args.last().unwrap(), "foo.c");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_show_includes_output_mode() {
+        for is_clang in [false, true] {
+            for show_includes in [false, true] {
+                let mut args = ovec!["/c", "main.c"];
+                if show_includes {
+                    args.push("/showIncludes".into());
+                }
+                let CompilerArguments::Ok(parsed) =
+                    super::parse_arguments(&args, Path::new("."), is_clang)
+                else {
+                    panic!("failed to parse {args:?}");
+                };
+                assert_eq!(
+                    parsed.color_mode,
+                    if show_includes && !is_clang {
+                        ColorMode::On
+                    } else {
+                        ColorMode::Auto
+                    }
+                );
             }
         }
     }

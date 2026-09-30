@@ -39,6 +39,12 @@ back to preprocessing for `/sourceDependencies`, `SCCACHE_BASEDIRS`, potential
 can hide inputs or outputs; changes to `INCLUDE` invalidate the direct entry.
 Clang-cl does not use preprocessor cache mode.
 
+MSVC cache keys include the detected `/showIncludes` prefix, its encoding context,
+and `VSLANG`. Changing `VSLANG` also selects separate compiler-detection state in
+the server. Native `/showIncludes` output bypasses ANSI filtering so localized
+prefix bytes reach Ninja unchanged. Configure CMake and build with the same
+compiler language so Ninja's detected prefix matches the output.
+
 The preprocessor cache may silently produce stale results in any of the following cases:
 
 - When a source file was compiled and its results were cached, a header file would have been included if it existed, but it did

@@ -124,10 +124,18 @@ changes, `CL` and `_CL_` fallback, absolute Windows paths with spaces, basedir
 relocation with the old tree still present, toggling `/showIncludes` against the
 same cache, `/showIncludes` with header edits, `/FI`, and `INCLUDE` changes, and
 deletion/regeneration of `/sourceDependencies` JSON. The `/showIncludes` cases
-check object hits and compare stdout/stderr with native output after converting
-CRLF to LF to match sccache's nonterminal output. Warm output must match cold
-sccache output byte-for-byte. Debug logging stays enabled only in the server
+check object hits and compare `/showIncludes` stdout/stderr byte-for-byte with
+native output. Ordinary output without `/showIncludes` is compared after CRLF
+to LF conversion to match the ANSI filter. Warm output must match cold sccache
+output byte-for-byte. Debug logging stays enabled only in the server
 so client log messages cannot contaminate the compiler output comparison.
+Language scenarios alternate English (`VSLANG=1033`) and Spanish (`VSLANG=3082`)
+in both orders, exercise an unset client `VSLANG` against a server started in
+Spanish, and repeat with direct mode disabled. They require distinct localized
+output, including non-ASCII prefix bytes, unchanged objects, and separate cold
+misses followed by warm hits. Install the `es-ES` Visual Studio language pack
+before running the matrix; the workflow installs it and does not silently skip
+localization coverage when resources are missing.
 It also checks conservative source/header time-macro and inactive `#import` fallbacks,
 and runs clang-cl separately. It compares restored objects with native compiler
 output except for `__TIME__` cases, where the clock can change between commands.

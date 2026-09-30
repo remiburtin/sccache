@@ -974,6 +974,28 @@ mod test {
             .unwrap()
     }
 
+    #[test]
+    fn test_msvc_show_includes_preserves_codepage_bytes() {
+        // CP850: "Remarque : inclusion du fichier : C:\\dépendances\\value.h".
+        let includes = b"Remarque : inclusion du fichier : C:\\d\x82pendances\\value.h\r\n";
+        let diagnostic = b"main.c: avertissement avec un accent: \x82\r\n";
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let response = CompileFinished {
+            retcode: Some(0),
+            stdout: includes.to_vec(),
+            stderr: diagnostic.to_vec(),
+            color_mode: ColorMode::On,
+            ..Default::default()
+        };
+        assert_eq!(
+            handle_compile_finished(response, &mut stdout, &mut stderr).unwrap(),
+            0
+        );
+        assert_eq!(stdout, includes);
+        assert_eq!(stderr, diagnostic);
+    }
+
     /// A `Connection` that immediately returns EOF on reads and discards writes.
     /// Used to simulate a server that disconnects before sending `CompileFinished`.
     struct DisconnectedConnection;

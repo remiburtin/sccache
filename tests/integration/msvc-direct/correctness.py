@@ -16,6 +16,8 @@ SCENARIOS = (
     "flags", "forced-include", "include-env", "cl-env", "suffix-cl-env",
     "windows-paths", "basedirs", "show-includes", "source-dependencies",
     "show-includes-header", "show-includes-forced-include", "show-includes-include-env",
+    "show-includes-language", "show-includes-language-reversed",
+    "show-includes-language-default", "show-includes-language-no-direct",
     "source-date", "source-time", "source-timestamp", "header-time",
     "source-import", "header-import", "clang-cl",
 )
@@ -24,6 +26,8 @@ SCENARIOS = (
 def evaluate(sccache, root, scenario):
     always_show_includes = scenario.startswith("show-includes-")
     input_scenario = scenario[len("show-includes-"):] if always_show_includes else scenario
+    language_switch = input_scenario.startswith("language")
+    alternating = scenario == "show-includes" or language_switch
     work = root / scenario
     work.mkdir()
     compiler = shutil.which("clang-cl.exe" if scenario == "clang-cl" else "cl.exe")
@@ -31,7 +35,7 @@ def evaluate(sccache, root, scenario):
     env = {
         key: value
         for key, value in os.environ.items()
-        if not key.upper().startswith("SCCACHE_") and key.upper() not in ("CL", "_CL_")
+        if not key.upper().startswith("SCCACHE_") and key.upper() not in ("CL", "_CL_", "VSLANG")
     }
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -48,6 +52,11 @@ def evaluate(sccache, root, scenario):
         SCCACHE_LOG="sccache=debug",
         SCCACHE_ERROR_LOG=str(log_path),
     )
+    if language_switch:
+        # Exercise a client that removes the server's inherited language setting.
+        env["VSLANG"] = "3082"
+    if scenario == "show-includes-language-no-direct":
+        env["SCCACHE_DIRECT"] = "0"
     trees = [work / "tree one", work / "tree two"]
     for tree in trees:
         tree.mkdir()
@@ -100,6 +109,20 @@ def evaluate(sccache, root, scenario):
     try:
         for index in range(4):
             changed = index >= 2
+            if language_switch:
+                languages = ("1033", "3082")
+                if scenario == "show-includes-language-reversed":
+                    languages = languages[::-1]
+                elif scenario == "show-includes-language-default":
+                    other_language = "3082"
+                    if outputs and b"Note: including file:" not in b"".join(outputs[0]):
+                        other_language = "1033"
+                    languages = (None, other_language)
+                language = languages[index % 2]
+                if language is None:
+                    env.pop("VSLANG", None)
+                else:
+                    env["VSLANG"] = language
             tree = trees[int(changed)] if scenario == "basedirs" else trees[0]
             flags = ["/nologo", "/c", "/Brepro", "main.cpp", "/Fomain.obj"]
             if scenario == "flags":
@@ -124,7 +147,7 @@ def evaluate(sccache, root, scenario):
                 flags += ["/sourceDependencies", "deps.json"]
             if always_show_includes:
                 flags += ["/showIncludes"]
-            if index == 2 and input_scenario not in (
+            if index == 2 and not language_switch and input_scenario not in (
                 "flags", "include-env", "cl-env", "suffix-cl-env", "basedirs", "show-includes"
             ):
                 header = tree / ("forced.h" if input_scenario == "forced-include" else "value.h")
@@ -150,6 +173,17 @@ def evaluate(sccache, root, scenario):
                     (b"value.h" in result.stdout + result.stderr) == bool(index % 2),
                     "Incorrect /showIncludes replay",
                 )
+            if language_switch:
+                direct = index >= 2 and env["SCCACHE_DIRECT"] == "1"
+                if language == "3082":
+                    include_lines = [
+                        line for line in (result.stdout + result.stderr).splitlines()
+                        if b"value.h" in line
+                    ]
+                    require(
+                        any(byte >= 128 for line in include_lines for byte in line),
+                        "Spanish include prefix missing; install the es-ES MSVC language pack",
+                    )
             if always_show_includes:
                 header = b"forced.h" if input_scenario == "forced-include" else b"value.h"
                 require(header in result.stdout + result.stderr, "Missing /showIncludes output")
@@ -174,6 +208,8 @@ def evaluate(sccache, root, scenario):
                     for line in log.splitlines()
                 ),
             }
+            if language_switch:
+                row["vslang"] = language
             report.append(row)
             require(row["direct_hits"] == int(direct), f"{scenario}: {row}")
             bypass = scenario in ("cl-env", "suffix-cl-env")
@@ -184,7 +220,7 @@ def evaluate(sccache, root, scenario):
             stats = run(f"stats-{index}", [sccache, "--show-stats", "--stats-format=json"])
             if scenario == "show-includes" or always_show_includes:
                 stats = json.loads(stats.stdout)["stats"]
-                hits = max(0, index - 1) if scenario == "show-includes" else (index + 1) // 2
+                hits = max(0, index - 1) if alternating else (index + 1) // 2
                 require(sum(stats["cache_hits"]["counts"].values()) == hits, str(stats))
                 require(
                     sum(stats["cache_misses"]["counts"].values()) == index + 1 - hits,
@@ -195,17 +231,16 @@ def evaluate(sccache, root, scenario):
             (tree / "main.obj").unlink()
             reference = run(f"reference-{index}", [compiler, *flags], tree)
             if scenario == "show-includes" or always_show_includes:
-                # The client's nonterminal output writer removes carriage returns.
-                native_output = tuple(
-                    stream.replace(b"\r\n", b"\n")
-                    for stream in (reference.stdout, reference.stderr)
-                )
+                native_output = (reference.stdout, reference.stderr)
+                if "/showIncludes" not in flags:
+                    # Ordinary diagnostics still pass through the ANSI filter.
+                    native_output = tuple(stream.replace(b"\r\n", b"\n") for stream in native_output)
                 require(
                     outputs[-1] == native_output,
                     f"{scenario}: compiler output differs at stage {index}",
                 )
-                if direct:
-                    cold_index = index - (2 if scenario == "show-includes" else 1)
+                if direct or (language_switch and index >= 2):
+                    cold_index = index - (2 if alternating else 1)
                     require(
                         outputs[-1] == outputs[cold_index],
                         f"{scenario}: cached output differs from cold output at stage {index}",
@@ -215,7 +250,10 @@ def evaluate(sccache, root, scenario):
                     objects[-1] == (tree / "main.obj").read_bytes(),
                     f"{scenario}: object differs from native compiler at stage {index}",
                 )
-        if scenario in (
+        if language_switch:
+            require(all(obj == objects[0] for obj in objects), "Language changed the object")
+            require(outputs[0] != outputs[1], "Language switch did not change the include output")
+        elif scenario in (
             "flags", "forced-include", "include-env", "cl-env", "suffix-cl-env",
             "windows-paths", "basedirs", "source-dependencies", "clang-cl",
         ) or always_show_includes:

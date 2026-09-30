@@ -755,7 +755,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
 
 /// Maps a compiler proxy path to a compiler proxy and it's last modification time
 type CompilerProxyMap<C> = HashMap<PathBuf, (Box<dyn CompilerProxy<C>>, FileTime)>;
-type CompilerMap<C> = HashMap<PathBuf, Option<CompilerCacheEntry<C>>>;
+type CompilerMap<C> = HashMap<(PathBuf, Option<OsString>), Option<CompilerCacheEntry<C>>>;
 
 /// entry of the compiler cache
 struct CompilerCacheEntry<C> {
@@ -1276,7 +1276,13 @@ where
             _ => None,
         };
 
-        let opt = match me1.compilers.read().await.get(&resolved_compiler_path) {
+        // MSVC's detected include prefix depends on the requesting client's language.
+        let vs_lang = env
+            .iter()
+            .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case("VSLANG"))
+            .map(|(_, value)| value.clone());
+        let compiler_key = (resolved_compiler_path.clone(), vs_lang.clone());
+        let opt = match me1.compilers.read().await.get(&compiler_key) {
             // It's a hit only if the mtime and dist archive data matches.
             Some(Some(entry)) => {
                 if entry.mtime == mtime && entry.dist_info == dist_info {
@@ -1316,7 +1322,7 @@ where
                     Ok((c, proxy)) => (c.clone(), proxy.clone()),
                     Err(err) => {
                         trace!("Inserting PLAIN cache map info for {:?}", path);
-                        me.compilers.write().await.insert(path, None);
+                        me.compilers.write().await.insert((path, vs_lang), None);
 
                         return Err(err);
                     }
@@ -1347,7 +1353,7 @@ where
                 me.compilers
                     .write()
                     .await
-                    .insert(resolved_compiler_path, Some(map_info));
+                    .insert(compiler_key, Some(map_info));
 
                 // drop the proxy information, response is compiler only
                 Ok(c)
@@ -2456,6 +2462,68 @@ fn waits_until_zero() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_msvc_compiler_detection_tracks_language() {
+        use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+        use crate::test::mock_storage::MockStorage;
+        use crate::test::utils::{TestFixture, next_command, single_threaded_runtime};
+
+        let runtime = single_threaded_runtime();
+        let f = TestFixture::new();
+        let executable = f.mk_bin("cl.exe").unwrap();
+        let header = f.touch("test.h").unwrap();
+        let header = header
+            .to_string_lossy()
+            .trim_start_matches("\\\\?\\")
+            .to_owned();
+        let service: SccacheService<Arc<std::sync::Mutex<MockCommandCreator>>> =
+            SccacheService::mock_with_storage(
+                Arc::new(MockStorage::new(None, false)),
+                runtime.handle().clone(),
+            );
+        for pass in 0..2 {
+            for language in [None, Some("1033"), Some("1036")] {
+                if pass == 0 {
+                    next_command(
+                        &service.creator,
+                        Ok(MockChild::new(exit_status(0), "compiler_id=msvc\n", "")),
+                    );
+                    let prefix = if language == Some("1036") {
+                        "Remarque : inclusion du fichier : "
+                    } else {
+                        "Note: including file: "
+                    };
+                    next_command(
+                        &service.creator,
+                        Ok(MockChild::new(
+                            exit_status(0),
+                            "",
+                            format!("{prefix}{header}\r\n"),
+                        )),
+                    );
+                }
+                let env: Vec<_> = language
+                    .map(|value| {
+                        (
+                            if pass == 0 { "VSLANG" } else { "vSlAnG" }.into(),
+                            OsString::from(value),
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                runtime
+                    .block_on(service.compiler_info(
+                        executable.clone(),
+                        f.tempdir.path().to_owned(),
+                        &[],
+                        &env,
+                    ))
+                    .unwrap();
+                assert!(service.creator.lock().unwrap().children.is_empty());
+            }
+        }
+    }
 
     struct StringWriter {
         buffer: String,

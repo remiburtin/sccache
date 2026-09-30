@@ -179,6 +179,10 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
     fn plusplus(&self) -> bool;
     /// Return the compiler version reported by the compiler executable.
     fn version(&self) -> Option<String>;
+    /// Additional compiler identity that affects cached output streams.
+    fn cache_key_extra(&self) -> Option<String> {
+        None
+    }
     /// Return the identity of the assembler the compiler would run, when it
     /// runs one at all.
     fn assembler_digest(&self) -> Option<String> {
@@ -234,7 +238,13 @@ where
         executable: PathBuf,
         pool: &tokio::runtime::Handle,
     ) -> Result<CCompiler<I>> {
-        let digest = Digest::file(executable.clone(), pool).await?;
+        let mut digest = Digest::file(executable.clone(), pool).await?;
+        if let Some(extra) = compiler.cache_key_extra() {
+            let mut m = Digest::new();
+            m.update(digest.as_bytes());
+            m.update(extra.as_bytes());
+            digest = m.finish();
+        }
 
         Ok(CCompiler {
             executable,
@@ -1497,6 +1507,7 @@ static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
         "WATCHOS_DEPLOYMENT_TARGET",
         "SDKROOT",
         "CCC_OVERRIDE_OPTIONS",
+        "VSLANG",
     ]
     .iter()
     .map(OsStr::new)
@@ -1631,6 +1642,8 @@ impl<'a> HashKeyParams<'a> {
         }
 
         for (var, val) in self.env_vars.iter() {
+            #[cfg(windows)]
+            let var = &OsString::from(var.to_string_lossy().to_ascii_uppercase());
             if CACHED_ENV_VARS.contains(var.as_os_str()) {
                 var.hash(&mut HashToDigest { digest: &mut m });
                 m.update(&b"="[..]);
@@ -1877,6 +1890,106 @@ mod test {
     }
 
     #[test]
+    fn test_msvc_output_locale_separates_cache_entries() {
+        use crate::cache::{CacheMode, disk::DiskCache};
+        use crate::compiler::msvc::Msvc;
+        use crate::mock_command::{MockChild, exit_status};
+        use crate::test::utils::{new_creator, next_command_calls};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let variants = [
+            ("Note: including file: ", None),
+            ("Remarque : inclusion du fichier : ", None),
+            ("Note: including file: ", Some("1033")),
+            ("Note: including file: ", Some("1036")),
+            ("Note: including file: ", Some("")),
+        ];
+        for direct in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path();
+            fs::write(cwd.join("cl.exe"), "compiler").unwrap();
+            fs::write(cwd.join("main.c"), "#include \"value.h\"\n").unwrap();
+            fs::write(cwd.join("value.h"), "#define VALUE 42\n").unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
+                cwd.join("cache"),
+                1024 * 1024,
+                runtime.handle(),
+                PreprocessorCacheModeConfig {
+                    use_preprocessor_cache_mode: direct,
+                    ..PreprocessorCacheModeConfig::activated()
+                },
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            let creator = new_creator();
+            let mut keys = Vec::new();
+            for pass in 0..2 {
+                for (prefix, vs_lang) in variants {
+                    let env_vars: Vec<_> = vs_lang
+                        .map(|value| {
+                            let name = if cfg!(windows) && pass == 1 {
+                                "vSlAnG"
+                            } else {
+                                "VSLANG"
+                            };
+                            (name.into(), OsString::from(value))
+                        })
+                        .into_iter()
+                        .collect();
+                    let compiler = runtime
+                        .block_on(CCompiler::new(
+                            Msvc {
+                                includes_prefix: prefix.into(),
+                                is_clang: false,
+                                version: None,
+                            },
+                            cwd.join("cl.exe"),
+                            runtime.handle(),
+                        ))
+                        .unwrap();
+                    let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
+                        &["/c".into(), "/showIncludes".into(), "main.c".into()],
+                        cwd,
+                        &env_vars,
+                    ) else {
+                        panic!("failed to parse MSVC arguments");
+                    };
+                    if pass == 0 || !direct {
+                        next_command_calls(&creator, |_| {
+                            Ok(MockChild::new(
+                                exit_status(0),
+                                "#line 1 \"value.h\"\nint value = 42;\n",
+                                "",
+                            ))
+                        });
+                    }
+                    keys.push(
+                        runtime
+                            .block_on(hasher.generate_hash_key(
+                                &creator,
+                                cwd.to_owned(),
+                                env_vars,
+                                false,
+                                runtime.handle(),
+                                false,
+                                storage.clone(),
+                                CacheControl::Default,
+                            ))
+                            .unwrap()
+                            .key,
+                    );
+                    assert!(creator.lock().unwrap().children.is_empty());
+                }
+            }
+            assert_eq!(&keys[..variants.len()], &keys[variants.len()..]);
+            assert_eq!(keys.iter().collect::<HashSet<_>>().len(), variants.len());
+        }
+    }
+
+    #[test]
     fn test_same_content() {
         let args = ovec!["a", "b", "c"];
         let h1 = HashKeyParams::new("abcd", Language::C, &args, b"hello world").compute();
@@ -1985,6 +2098,19 @@ mod test {
 
             assert_neq!(h1, h2);
             assert_neq!(h2, h3);
+            #[cfg(windows)]
+            {
+                let vars = vec![(
+                    var.to_string_lossy().to_lowercase().into(),
+                    "something".into(),
+                )];
+                assert_eq!(
+                    h2,
+                    HashKeyParams::new("abcd", Language::C, &args, b"hello world")
+                        .with_env_vars(&vars)
+                        .compute()
+                );
+            }
         }
     }
 
