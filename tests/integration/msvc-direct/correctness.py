@@ -93,8 +93,10 @@ def evaluate(sccache, root, scenario):
         require(result.returncode == 0, f"{scenario}/{label} failed; inspect {work}")
         return result
 
-    report, objects = [], []
+    report, objects, outputs = [], [], []
     run("start", [sccache, "--start-server"])
+    # Keep server tracing without adding client debug logs to compiler stderr.
+    env.pop("SCCACHE_LOG")
     try:
         for index in range(4):
             changed = index >= 2
@@ -134,6 +136,7 @@ def evaluate(sccache, root, scenario):
             (tree / "deps.json").unlink(missing_ok=True)
             before = log_path.stat().st_size
             result = run(f"build-{index}", [sccache, compiler, *flags], tree)
+            outputs.append((result.stdout, result.stderr))
             objects.append((tree / "main.obj").read_bytes())
             log = log_path.read_bytes()[before:]
             (work / f"build-{index}.log").write_bytes(log)
@@ -192,10 +195,21 @@ def evaluate(sccache, root, scenario):
             (tree / "main.obj").unlink()
             reference = run(f"reference-{index}", [compiler, *flags], tree)
             if scenario == "show-includes" or always_show_includes:
+                # The client's nonterminal output writer removes carriage returns.
+                native_output = tuple(
+                    stream.replace(b"\r\n", b"\n")
+                    for stream in (reference.stdout, reference.stderr)
+                )
                 require(
-                    (result.stdout, result.stderr) == (reference.stdout, reference.stderr),
+                    outputs[-1] == native_output,
                     f"{scenario}: compiler output differs at stage {index}",
                 )
+                if direct:
+                    cold_index = index - (2 if scenario == "show-includes" else 1)
+                    require(
+                        outputs[-1] == outputs[cold_index],
+                        f"{scenario}: cached output differs from cold output at stage {index}",
+                    )
             if scenario not in ("source-time", "header-time"):
                 require(
                     objects[-1] == (tree / "main.obj").read_bytes(),

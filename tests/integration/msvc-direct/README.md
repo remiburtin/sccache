@@ -124,7 +124,10 @@ changes, `CL` and `_CL_` fallback, absolute Windows paths with spaces, basedir
 relocation with the old tree still present, toggling `/showIncludes` against the
 same cache, `/showIncludes` with header edits, `/FI`, and `INCLUDE` changes, and
 deletion/regeneration of `/sourceDependencies` JSON. The `/showIncludes` cases
-check object hits and compare stdout/stderr byte-for-byte with native output.
+check object hits and compare stdout/stderr with native output after converting
+CRLF to LF to match sccache's nonterminal output. Warm output must match cold
+sccache output byte-for-byte. Debug logging stays enabled only in the server
+so client log messages cannot contaminate the compiler output comparison.
 It also checks conservative source/header time-macro and inactive `#import` fallbacks,
 and runs clang-cl separately. It compares restored objects with native compiler
 output except for `__TIME__` cases, where the clock can change between commands.

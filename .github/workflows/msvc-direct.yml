@@ -58,7 +58,7 @@ jobs:
       - name: Test MSVC direct-mode guards and pipeline
         run: |
           cargo test --locked --no-default-features --lib compiler::msvc
-          cargo test --locked --no-default-features --lib test_msvc_direct_cache_pipeline
+          cargo test --locked --no-default-features --lib test_msvc_
           cargo test --locked --no-default-features --lib test_direct_key
 
       - name: Evaluate server-side mode
