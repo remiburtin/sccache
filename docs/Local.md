@@ -30,9 +30,11 @@ Preprocessor cache mode will be disabled in any of the following cases:
 - Certain strings such as `__DATE__`, `__TIME__`, `__TIMESTAMP__` are present in the source code,
   indicating that the preprocessor result may change based on external factors
 
-Native MSVC uses `/E` line markers to track included headers. It falls back to
-preprocessing for `/showIncludes`, `/sourceDependencies`, `SCCACHE_BASEDIRS`,
-potential `#import` use, and source or header time macros. A nonempty `CL` or
+Native MSVC uses `/E` line markers to track included headers, including with
+`/showIncludes`. Compilations with `/showIncludes` use separate direct and object
+cache entries, preserving the compiler's include output on cache hits. It falls
+back to preprocessing for `/sourceDependencies`, `SCCACHE_BASEDIRS`, potential
+`#import` use, and source or header time macros. A nonempty `CL` or
 `_CL_` environment variable bypasses compilation caching because its options
 can hide inputs or outputs; changes to `INCLUDE` invalidate the direct entry.
 Clang-cl does not use preprocessor cache mode.

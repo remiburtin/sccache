@@ -399,6 +399,11 @@ where
         preprocessor_and_arch_args.extend(self.parsed_args.arch_args.clone());
         // common_args is used in preprocessing too
         preprocessor_and_arch_args.extend(self.parsed_args.common_args.clone());
+        if self.compiler.kind() == CCompilerKind::Msvc {
+            // Manifests store final object-cache keys, so /showIncludes must
+            // distinguish manifests as well as the cached output streams.
+            preprocessor_and_arch_args.extend(self.parsed_args.dependency_args.clone());
+        }
 
         let absolute_input_path: Cow<'_, _> = if self.parsed_args.input.is_absolute() {
             Cow::Borrowed(&self.parsed_args.input)
@@ -1658,7 +1663,6 @@ mod test {
             .enable_all()
             .build()
             .unwrap();
-        let mut ordinary_key = None;
         for (source, header, flags, basedirs, direct) in [
             (
                 "#include \"value.h\"\n",
@@ -1700,7 +1704,7 @@ mod test {
                 "#define VALUE 42\n",
                 ovec!["/showIncludes"],
                 false,
-                false,
+                true,
             ),
             (
                 "#include \"value.h\"\n",
@@ -1787,11 +1791,88 @@ mod test {
             assert_eq!(keys[0], keys[1]);
             assert_eq!(keys[2], keys[3]);
             assert_ne!(keys[0], keys[2]);
-            if direct {
-                ordinary_key = Some(keys[0].clone());
-            } else if hasher.parsed_args.msvc_show_includes {
-                assert_ne!(ordinary_key.as_ref().unwrap(), &keys[0]);
+        }
+    }
+
+    #[test]
+    fn test_msvc_show_includes_has_separate_direct_manifest() {
+        use crate::cache::{CacheMode, disk::DiskCache};
+        use crate::compiler::msvc::Msvc;
+        use crate::mock_command::{MockChild, exit_status};
+        use crate::test::utils::{new_creator, next_command_calls};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for show_includes_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path();
+            fs::write(cwd.join("main.c"), "#include \"value.h\"\n").unwrap();
+            fs::write(cwd.join("value.h"), "#define VALUE 42\n").unwrap();
+            let storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
+                cwd.join("cache"),
+                1024 * 1024,
+                runtime.handle(),
+                PreprocessorCacheModeConfig::activated(),
+                CacheMode::ReadWrite,
+                vec![],
+            ));
+            let creator = new_creator();
+            let mut keys = Vec::new();
+            for index in 0..4 {
+                let show_includes = (index % 2 == 0) == show_includes_first;
+                let compiler = Msvc {
+                    includes_prefix: "Note: including file: ".into(),
+                    is_clang: false,
+                    version: None,
+                };
+                let mut args = ovec!["/c", "main.c"];
+                if show_includes {
+                    args.push("/showIncludes".into());
+                }
+                let CompilerArguments::Ok(parsed_args) = compiler.parse_arguments(&args, cwd, &[])
+                else {
+                    panic!("failed to parse {args:?}");
+                };
+                let mut hasher = CCompilerHasher {
+                    parsed_args,
+                    executable: "cl.exe".into(),
+                    executable_digest: "compiler".into(),
+                    compiler,
+                };
+                if index < 2 {
+                    next_command_calls(&creator, move |args| {
+                        assert!(args.iter().any(|arg| arg == "-E"));
+                        assert_eq!(args.iter().any(|arg| arg == "/showIncludes"), show_includes);
+                        Ok(MockChild::new(
+                            exit_status(0),
+                            "#line 1 \"value.h\"\nint value = 42;\n",
+                            "",
+                        ))
+                    });
+                }
+                // Both variants must preprocess once, then hit their own manifest.
+                keys.push(
+                    runtime
+                        .block_on(hasher.generate_hash_key(
+                            &creator,
+                            cwd.to_owned(),
+                            vec![],
+                            false,
+                            runtime.handle(),
+                            false,
+                            storage.clone(),
+                            CacheControl::Default,
+                        ))
+                        .unwrap()
+                        .key,
+                );
+                assert!(creator.lock().unwrap().children.is_empty());
             }
+            assert_ne!(keys[0], keys[1]);
+            assert_eq!(keys[0], keys[2]);
+            assert_eq!(keys[1], keys[3]);
         }
     }
 

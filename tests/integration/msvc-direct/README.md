@@ -102,10 +102,12 @@ that happen to emit line markers.
 `INCLUDE` is part of the direct key (case-insensitive environment names on
 Windows). Nonempty `CL` or `_CL_` bypass caching entirely: merely hashing these
 strings cannot account for hidden response files, PCH/module inputs or outputs.
-`/sourceDependencies` and `/showIncludes` continue to preprocess each time;
-the former's JSON is not a cached artifact. `/showIncludes` also distinguishes
-object-cache keys so a cached compilation without include output cannot answer
-a request that needs it. Existing PCH/module rejection remains in place.
+`/sourceDependencies` continues to preprocess each time because its JSON is not
+a cached artifact. `/showIncludes` supports direct hits using `/E` line markers
+for header discovery. It distinguishes both manifest and object-cache keys so a
+cached compilation without include output cannot answer a request that needs it.
+The object cache replays the original stdout and stderr. Existing PCH/module
+rejection remains in place.
 
 Source time macros now disable the generic direct key unless explicitly ignored.
 For MSVC, source/header scans additionally reject time macros, potential `import`
@@ -120,8 +122,10 @@ cannot safely be shared between relocated checkouts.
 invocations. It checks `/D` and `/U`, `/FI` header changes, `INCLUDE` search-path
 changes, `CL` and `_CL_` fallback, absolute Windows paths with spaces, basedir
 relocation with the old tree still present, toggling `/showIncludes` against the
-same cache, and deletion/regeneration of `/sourceDependencies` JSON. It also
-checks conservative source/header time-macro and inactive `#import` fallbacks,
+same cache, `/showIncludes` with header edits, `/FI`, and `INCLUDE` changes, and
+deletion/regeneration of `/sourceDependencies` JSON. The `/showIncludes` cases
+check object hits and compare stdout/stderr byte-for-byte with native output.
+It also checks conservative source/header time-macro and inactive `#import` fallbacks,
 and runs clang-cl separately. It compares restored objects with native compiler
 output except for `__TIME__` cases, where the clock can change between commands.
 The inactive imports test conservative detection without requiring a type library;

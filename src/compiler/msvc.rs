@@ -954,8 +954,6 @@ pub fn parse_arguments(
         Some("clang-cl".into())
     } else if depfile.is_some() {
         Some("/sourceDependencies".into())
-    } else if show_includes {
-        Some("/showIncludes".into())
     } else if preprocessor_args
         .iter()
         .chain(&common_args)
@@ -1587,7 +1585,12 @@ mod test {
                 ovec!["/sourceDependencies", "foo.json"],
                 Some("/sourceDependencies"),
             ),
-            (ovec!["/showIncludes"], Some("/showIncludes")),
+            (ovec!["/showIncludes"], None),
+            (ovec!["/showIncludes", "/FIforced.h"], None),
+            (
+                ovec!["/showIncludes", "/sourceDependencies", "foo.json"],
+                Some("/sourceDependencies"),
+            ),
             (ovec!["/DWHEN=__DATE__"], Some("time macros")),
             (ovec!["/DWHEN=__TIME__"], Some("time macros")),
             (ovec!["/DWHEN=__TIMESTAMP__"], Some("time macros")),

@@ -15,12 +15,15 @@ from reproduce import require
 SCENARIOS = (
     "flags", "forced-include", "include-env", "cl-env", "suffix-cl-env",
     "windows-paths", "basedirs", "show-includes", "source-dependencies",
+    "show-includes-header", "show-includes-forced-include", "show-includes-include-env",
     "source-date", "source-time", "source-timestamp", "header-time",
     "source-import", "header-import", "clang-cl",
 )
 
 
 def evaluate(sccache, root, scenario):
+    always_show_includes = scenario.startswith("show-includes-")
+    input_scenario = scenario[len("show-includes-"):] if always_show_includes else scenario
     work = root / scenario
     work.mkdir()
     compiler = shutil.which("clang-cl.exe" if scenario == "clang-cl" else "cl.exe")
@@ -53,9 +56,9 @@ def evaluate(sccache, root, scenario):
         source = '#include "value.h"\nint value() { return VALUE; }\n'
         if scenario in ("flags", "cl-env", "suffix-cl-env"):
             source = '#include "value.h"\nint value() { return SELECT; }\n'
-        elif scenario == "forced-include":
+        elif input_scenario == "forced-include":
             source = "int value() { return FORCED; }\n"
-        elif scenario == "include-env":
+        elif input_scenario == "include-env":
             source = "#include <value.h>\nint value() { return VALUE; }\n"
         elif scenario in ("source-date", "source-time", "source-timestamp"):
             token = scenario[len("source-"):].upper()
@@ -99,9 +102,9 @@ def evaluate(sccache, root, scenario):
             flags = ["/nologo", "/c", "/Brepro", "main.cpp", "/Fomain.obj"]
             if scenario == "flags":
                 flags += [f"/DSELECT={43 if changed else 42}", "/UUNUSED"]
-            elif scenario == "forced-include":
+            elif input_scenario == "forced-include":
                 flags += [f"/FI{tree / 'forced.h'}"]
-            elif scenario == "include-env":
+            elif input_scenario == "include-env":
                 env["INCLUDE"] = (
                     str(includes[int(changed)]) + ";" + os.environ.get("INCLUDE", "")
                 )
@@ -117,10 +120,12 @@ def evaluate(sccache, root, scenario):
                 flags += ["/showIncludes"]
             elif scenario == "source-dependencies":
                 flags += ["/sourceDependencies", "deps.json"]
-            if index == 2 and scenario not in (
+            if always_show_includes:
+                flags += ["/showIncludes"]
+            if index == 2 and input_scenario not in (
                 "flags", "include-env", "cl-env", "suffix-cl-env", "basedirs", "show-includes"
             ):
-                header = tree / ("forced.h" if scenario == "forced-include" else "value.h")
+                header = tree / ("forced.h" if input_scenario == "forced-include" else "value.h")
                 header.write_text(
                     header.read_text(encoding="utf-8").replace("42", "43"), encoding="utf-8"
                 )
@@ -134,13 +139,22 @@ def evaluate(sccache, root, scenario):
             (work / f"build-{index}.log").write_bytes(log)
             direct = scenario in (
                 "flags", "forced-include", "include-env", "windows-paths"
-            ) and index % 2 == 1
+            ) or always_show_includes
+            direct = direct and index % 2 == 1
             if scenario == "show-includes":
-                direct = index == 2
+                direct = index >= 2
                 require(
                     (b"value.h" in result.stdout + result.stderr) == bool(index % 2),
                     "Incorrect /showIncludes replay",
                 )
+            if always_show_includes:
+                header = b"forced.h" if input_scenario == "forced-include" else b"value.h"
+                require(header in result.stdout + result.stderr, "Missing /showIncludes output")
+                if input_scenario == "include-env":
+                    require(
+                        includes[int(changed)].name.encode() in result.stdout + result.stderr,
+                        "Incorrect INCLUDE path in /showIncludes output",
+                    )
             if scenario == "source-dependencies":
                 require((tree / "deps.json").exists(), "Dependency output was not restored")
                 dependency_bytes = (tree / "deps.json").read_bytes()
@@ -164,11 +178,24 @@ def evaluate(sccache, root, scenario):
                 row["preprocessor_commands"] == int(not direct and not bypass),
                 f"{scenario}: {row}",
             )
-            run(f"stats-{index}", [sccache, "--show-stats", "--stats-format=json"])
+            stats = run(f"stats-{index}", [sccache, "--show-stats", "--stats-format=json"])
+            if scenario == "show-includes" or always_show_includes:
+                stats = json.loads(stats.stdout)["stats"]
+                hits = max(0, index - 1) if scenario == "show-includes" else (index + 1) // 2
+                require(sum(stats["cache_hits"]["counts"].values()) == hits, str(stats))
+                require(
+                    sum(stats["cache_misses"]["counts"].values()) == index + 1 - hits,
+                    str(stats),
+                )
             # Same output pathname and flags avoid debug-path differences. Read
             # cached outputs first so the reference cannot repair a missing file.
             (tree / "main.obj").unlink()
-            run(f"reference-{index}", [compiler, *flags], tree)
+            reference = run(f"reference-{index}", [compiler, *flags], tree)
+            if scenario == "show-includes" or always_show_includes:
+                require(
+                    (result.stdout, result.stderr) == (reference.stdout, reference.stderr),
+                    f"{scenario}: compiler output differs at stage {index}",
+                )
             if scenario not in ("source-time", "header-time"):
                 require(
                     objects[-1] == (tree / "main.obj").read_bytes(),
@@ -177,7 +204,7 @@ def evaluate(sccache, root, scenario):
         if scenario in (
             "flags", "forced-include", "include-env", "cl-env", "suffix-cl-env",
             "windows-paths", "basedirs", "source-dependencies", "clang-cl",
-        ):
+        ) or always_show_includes:
             require(
                 objects[0] == objects[1] and objects[2] == objects[3],
                 f"{scenario}: unchanged objects differ",
