@@ -531,6 +531,11 @@ where
     /// Return the state of any `--color` option passed to the compiler.
     fn color_mode(&self) -> ColorMode;
 
+    #[cfg(windows)]
+    fn output_codepage(&self) -> Option<u32> {
+        None
+    }
+
     /// Look up a cached compile result in `storage`. If not found, run the
     /// compile and store the result.
     #[allow(clippy::too_many_arguments)]

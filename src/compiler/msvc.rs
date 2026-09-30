@@ -55,6 +55,10 @@ impl CCompilerImpl for Msvc {
     fn version(&self) -> Option<String> {
         self.version.clone()
     }
+    #[cfg(windows)]
+    fn output_codepage(&self) -> Option<u32> {
+        (!self.is_clang).then(output_codepage)
+    }
     fn cache_key_extra(&self) -> Option<String> {
         // Equal compiler binaries can load different language resources. Include
         // the encoding too, since Ninja matches the prefix as raw bytes.
@@ -174,9 +178,12 @@ fn from_local_codepage(multi_byte_str: &[u8]) -> io::Result<String> {
 
 #[cfg(windows)]
 pub fn from_local_codepage(multi_byte_str: &[u8]) -> io::Result<String> {
-    use windows_sys::Win32::Globalization::{CP_OEMCP, MB_ERR_INVALID_CHARS, MultiByteToWideChar};
+    from_codepage(multi_byte_str, output_codepage())
+}
 
-    let codepage = CP_OEMCP;
+#[cfg(windows)]
+fn from_codepage(multi_byte_str: &[u8], codepage: u32) -> io::Result<String> {
+    use windows_sys::Win32::Globalization::{MB_ERR_INVALID_CHARS, MultiByteToWideChar};
     let flags = MB_ERR_INVALID_CHARS;
 
     // Empty string
@@ -189,7 +196,7 @@ pub fn from_local_codepage(multi_byte_str: &[u8]) -> io::Result<String> {
             codepage,
             flags,
             multi_byte_str.as_ptr().cast(),
-            multi_byte_str.len() as i32,
+            multi_byte_str.len().try_into().map_err(io::Error::other)?,
             std::ptr::null_mut(),
             0,
         );
@@ -212,6 +219,61 @@ pub fn from_local_codepage(multi_byte_str: &[u8]) -> io::Result<String> {
             }
         }
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn output_codepage() -> u32 {
+    unsafe {
+        let console = windows_sys::Win32::System::Console::GetConsoleOutputCP();
+        if console == 0 {
+            // The background server has no console; its compiler uses the OEM code page.
+            windows_sys::Win32::Globalization::GetOEMCP()
+        } else {
+            console
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn transcode_output(data: &[u8], from: u32, to: u32) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Globalization::WideCharToMultiByte;
+
+    if from == to || data.is_empty() {
+        return Ok(data.to_vec());
+    }
+    let wide: Vec<u16> = from_codepage(data, from)?.encode_utf16().collect();
+    let wide_len = wide.len().try_into().map_err(io::Error::other)?;
+    unsafe {
+        let len = WideCharToMultiByte(
+            to,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut output = vec![0; len as usize];
+        let written = WideCharToMultiByte(
+            to,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            output.as_mut_ptr(),
+            len,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        if written == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        output.truncate(written as usize);
+        Ok(output)
     }
 }
 
@@ -1554,6 +1616,30 @@ mod test {
 
     fn parse_arguments_clang(arguments: Vec<OsString>) -> CompilerArguments<ParsedArguments> {
         super::parse_arguments(&arguments, &std::env::current_dir().unwrap(), true)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_msvc_output_transcoding() {
+        let utf8 = "main.cpp\r\nNota: inclusión del archivo: C:\\dépendances\\value.h\r\n";
+        let oem = b"main.cpp\r\nNota: inclusi\xa2n del archivo: C:\\d\x82pendances\\value.h\r\n";
+        let ansi = b"main.cpp\r\nNota: inclusi\xf3n del archivo: C:\\d\xe9pendances\\value.h\r\n";
+        for (bytes, codepage) in [(oem.as_slice(), 850), (ansi.as_slice(), 1252)] {
+            assert_eq!(
+                transcode_output(bytes, codepage, 65001).unwrap(),
+                utf8.as_bytes()
+            );
+            assert_eq!(
+                transcode_output(utf8.as_bytes(), 65001, codepage).unwrap(),
+                bytes
+            );
+        }
+        assert_eq!(
+            transcode_output(b"\xff\r\n", 65001, 65001).unwrap(),
+            b"\xff\r\n"
+        );
+        assert!(transcode_output(b"", 850, 65001).unwrap().is_empty());
+        assert!(transcode_output(b"\xff", 65001, 850).is_err());
     }
 
     #[test]
@@ -3529,7 +3615,10 @@ mod test {
             ];
 
             // Test the conversion from the OEM codepage to UTF-8
-            assert_eq!(from_local_codepage(&INPUT_BYTES).unwrap(), INPUT_STRING);
+            assert_eq!(
+                from_codepage(&INPUT_BYTES, current_oemcp).unwrap(),
+                INPUT_STRING
+            );
 
             // The characters in INPUT_STRING encoded in UTF-16
             const INPUT_WORDS: [u16; 16] = [

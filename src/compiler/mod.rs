@@ -35,4 +35,6 @@ mod counted_array;
 
 pub use crate::compiler::c::CCompilerKind;
 pub use crate::compiler::compiler::*;
+#[cfg(windows)]
+pub(crate) use crate::compiler::msvc::{output_codepage as msvc_output_codepage, transcode_output};
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;

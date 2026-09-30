@@ -1,9 +1,11 @@
 """Check native MSVC direct hits and conservative fallbacks against cl.exe."""
 
 import argparse
+import ctypes
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import subprocess
@@ -18,6 +20,8 @@ SCENARIOS = (
     "show-includes-header", "show-includes-forced-include", "show-includes-include-env",
     "show-includes-language", "show-includes-language-reversed",
     "show-includes-language-default", "show-includes-language-no-direct",
+    "show-includes-codepage", "show-includes-codepage-reversed",
+    "show-includes-codepage-no-direct",
     "source-date", "source-time", "source-timestamp", "header-time",
     "source-import", "header-import", "clang-cl",
 )
@@ -26,7 +30,8 @@ SCENARIOS = (
 def evaluate(sccache, root, scenario):
     always_show_includes = scenario.startswith("show-includes-")
     input_scenario = scenario[len("show-includes-"):] if always_show_includes else scenario
-    language_switch = input_scenario.startswith("language")
+    codepage_switch = input_scenario.startswith("codepage")
+    language_switch = input_scenario.startswith("language") or codepage_switch
     alternating = scenario == "show-includes" or language_switch
     work = root / scenario
     work.mkdir()
@@ -55,7 +60,7 @@ def evaluate(sccache, root, scenario):
     if language_switch:
         # Exercise a client that removes the server's inherited language setting.
         env["VSLANG"] = "3082"
-    if scenario == "show-includes-language-no-direct":
+    if scenario.endswith("-no-direct"):
         env["SCCACHE_DIRECT"] = "0"
     trees = [work / "tree one", work / "tree two"]
     for tree in trees:
@@ -103,6 +108,7 @@ def evaluate(sccache, root, scenario):
         return result
 
     report, objects, outputs = [], [], []
+    original_codepage = ctypes.windll.kernel32.GetConsoleOutputCP()
     run("start", [sccache, "--start-server"])
     # Keep server tracing without adding client debug logs to compiler stderr.
     env.pop("SCCACHE_LOG")
@@ -123,6 +129,15 @@ def evaluate(sccache, root, scenario):
                     env.pop("VSLANG", None)
                 else:
                     env["VSLANG"] = language
+            if codepage_switch:
+                language = env["VSLANG"] = "3082"
+                codepages = (65001, 850)
+                if scenario == "show-includes-codepage-reversed":
+                    codepages = codepages[::-1]
+                require(
+                    ctypes.windll.kernel32.SetConsoleOutputCP(codepages[index % 2]),
+                    "Failed to set console output code page",
+                )
             tree = trees[int(changed)] if scenario == "basedirs" else trees[0]
             flags = ["/nologo", "/c", "/Brepro", "main.cpp", "/Fomain.obj"]
             if scenario == "flags":
@@ -174,7 +189,7 @@ def evaluate(sccache, root, scenario):
                     "Incorrect /showIncludes replay",
                 )
             if language_switch:
-                direct = index >= 2 and env["SCCACHE_DIRECT"] == "1"
+                direct = index >= (1 if codepage_switch else 2) and env["SCCACHE_DIRECT"] == "1"
                 if language == "3082":
                     include_lines = [
                         line for line in (result.stdout + result.stderr).splitlines()
@@ -210,6 +225,10 @@ def evaluate(sccache, root, scenario):
             }
             if language_switch:
                 row["vslang"] = language
+                row["console_output_codepage"] = ctypes.windll.kernel32.GetConsoleOutputCP()
+                server_codepage = re.search(rb"MSVC output code page: (\d+)", log)
+                require(server_codepage, "Missing compiler output code page in server log")
+                row["server_output_codepage"] = int(server_codepage.group(1))
             report.append(row)
             require(row["direct_hits"] == int(direct), f"{scenario}: {row}")
             bypass = scenario in ("cl-env", "suffix-cl-env")
@@ -220,7 +239,9 @@ def evaluate(sccache, root, scenario):
             stats = run(f"stats-{index}", [sccache, "--show-stats", "--stats-format=json"])
             if scenario == "show-includes" or always_show_includes:
                 stats = json.loads(stats.stdout)["stats"]
-                hits = max(0, index - 1) if alternating else (index + 1) // 2
+                hits = index if codepage_switch else (
+                    max(0, index - 1) if alternating else (index + 1) // 2
+                )
                 require(sum(stats["cache_hits"]["counts"].values()) == hits, str(stats))
                 require(
                     sum(stats["cache_misses"]["counts"].values()) == index + 1 - hits,
@@ -239,7 +260,7 @@ def evaluate(sccache, root, scenario):
                     outputs[-1] == native_output,
                     f"{scenario}: compiler output differs at stage {index}",
                 )
-                if direct or (language_switch and index >= 2):
+                if (direct or language_switch) and index >= (2 if alternating else 1):
                     cold_index = index - (2 if alternating else 1)
                     require(
                         outputs[-1] == outputs[cold_index],
@@ -265,6 +286,11 @@ def evaluate(sccache, root, scenario):
                 objects[0] != objects[2], f"{scenario}: changed input did not change the object"
             )
     finally:
+        if codepage_switch:
+            require(
+                ctypes.windll.kernel32.SetConsoleOutputCP(original_codepage),
+                "Failed to restore console output code page",
+            )
         (work / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         run("stop", [sccache, "--stop-server"])
 

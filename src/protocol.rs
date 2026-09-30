@@ -94,6 +94,9 @@ pub struct CompileFinished {
     pub stderr: Vec<u8>,
     /// The state of any compiler options passed to control color output.
     pub color_mode: ColorMode,
+    /// Encoding of native MSVC output before conversion to the client's code page.
+    #[cfg(windows)]
+    pub output_codepage: Option<u32>,
 }
 
 /// The contents of a compile request from a client.

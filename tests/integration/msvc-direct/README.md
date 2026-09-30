@@ -136,6 +136,10 @@ output, including non-ASCII prefix bytes, unchanged objects, and separate cold
 misses followed by warm hits. Install the `es-ES` Visual Studio language pack
 before running the matrix; the workflow installs it and does not silently skip
 localization coverage when resources are missing.
+Code-page scenarios keep Spanish selected while switching the client console
+between UTF-8 and CP850 in both orders, including with direct mode disabled.
+They compare native output byte-for-byte and require cache hits across code-page
+changes. Reports record the client console code page alongside `VSLANG`.
 It also checks conservative source/header time-macro and inactive `#import` fallbacks,
 and runs clang-cl separately. It compares restored objects with native compiler
 output except for `__TIME__` cases, where the clock can change between commands.

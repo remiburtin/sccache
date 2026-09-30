@@ -41,9 +41,11 @@ Clang-cl does not use preprocessor cache mode.
 
 MSVC cache keys include the detected `/showIncludes` prefix, its encoding context,
 and `VSLANG`. Changing `VSLANG` also selects separate compiler-detection state in
-the server. Native `/showIncludes` output bypasses ANSI filtering so localized
-prefix bytes reach Ninja unchanged. Configure CMake and build with the same
-compiler language so Ninja's detected prefix matches the output.
+the server. Native `/showIncludes` output bypasses ANSI filtering. When the
+server and client use different Windows code pages, the client converts the
+cached output to its console code page, preserving line endings. Configure CMake
+and build with the same compiler language so Ninja's detected prefix matches
+the output.
 
 The preprocessor cache may silently produce stale results in any of the following cases:
 

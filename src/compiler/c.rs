@@ -183,6 +183,10 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + Sync + 'static {
     fn cache_key_extra(&self) -> Option<String> {
         None
     }
+    #[cfg(windows)]
+    fn output_codepage(&self) -> Option<u32> {
+        None
+    }
     /// Return the identity of the assembler the compiler would run, when it
     /// runs one at all.
     fn assembler_digest(&self) -> Option<String> {
@@ -725,6 +729,15 @@ where
 
     fn color_mode(&self) -> ColorMode {
         self.parsed_args.color_mode
+    }
+
+    #[cfg(windows)]
+    fn output_codepage(&self) -> Option<u32> {
+        if self.parsed_args.msvc_show_includes {
+            self.compiler.output_codepage()
+        } else {
+            None
+        }
     }
 
     fn output_pretty(&self) -> Cow<'_, str> {
@@ -1664,6 +1677,42 @@ mod test {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn test_msvc_output_codepage_metadata() {
+        use crate::compiler::msvc::Msvc;
+        use crate::mock_command::ProcessCommandCreator;
+
+        for is_clang in [false, true] {
+            for show_includes in [false, true] {
+                let compiler = Msvc {
+                    includes_prefix: "Note: including file: ".into(),
+                    is_clang,
+                    version: None,
+                };
+                let mut args = ovec!["/c", "main.c"];
+                if show_includes {
+                    args.push("/showIncludes".into());
+                }
+                let CompilerArguments::Ok(parsed_args) =
+                    compiler.parse_arguments(&args, Path::new("."), &[])
+                else {
+                    panic!("failed to parse {args:?}");
+                };
+                let hasher = CCompilerHasher {
+                    parsed_args,
+                    executable: "cl.exe".into(),
+                    executable_digest: "compiler".into(),
+                    compiler,
+                };
+                assert_eq!(
+                    <_ as CompilerHasher<ProcessCommandCreator>>::output_codepage(&hasher),
+                    (show_includes && !is_clang).then(crate::compiler::msvc_output_codepage),
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_msvc_direct_cache_pipeline() {

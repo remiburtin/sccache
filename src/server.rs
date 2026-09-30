@@ -1448,6 +1448,12 @@ where
 
         let out_pretty = hasher.output_pretty().into_owned();
         let color_mode = hasher.color_mode();
+        #[cfg(windows)]
+        let output_codepage = hasher.output_codepage();
+        #[cfg(windows)]
+        if let Some(codepage) = output_codepage {
+            debug!("MSVC output code page: {codepage}");
+        }
 
         let (kind, lang) = {
             // HACK: See note in src/compiler/nvcc.rs
@@ -1598,6 +1604,10 @@ where
 
                     res.stdout = stdout;
                     res.stderr = stderr;
+                    #[cfg(windows)]
+                    {
+                        res.output_codepage = output_codepage;
+                    }
                 }
                 Err(err) => {
                     match err.downcast::<ProcessError>() {
@@ -1613,6 +1623,10 @@ where
                             }
                             res.stdout = output.stdout;
                             res.stderr = output.stderr;
+                            #[cfg(windows)]
+                            {
+                                res.output_codepage = output_codepage;
+                            }
                         }
                         Err(err) => match err.downcast::<HttpClientError>() {
                             Ok(HttpClientError(msg)) => {

@@ -457,6 +457,20 @@ fn handle_compile_finished(
     stderr: &mut dyn Write,
 ) -> Result<i32> {
     trace!("handle_compile_finished");
+    #[cfg(windows)]
+    let response = {
+        let mut response = response;
+        if let Some(from) = response.output_codepage {
+            let to = crate::compiler::msvc_output_codepage();
+            if from != to {
+                response.stdout = crate::compiler::transcode_output(&response.stdout, from, to)
+                    .context("Failed to convert MSVC stdout to the client code page")?;
+                response.stderr = crate::compiler::transcode_output(&response.stderr, from, to)
+                    .context("Failed to convert MSVC stderr to the client code page")?;
+            }
+        }
+        response
+    };
     fn write_output(
         stream: impl IsTerminal,
         writer: &mut dyn Write,
@@ -994,6 +1008,34 @@ mod test {
         );
         assert_eq!(stdout, includes);
         assert_eq!(stderr, diagnostic);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_msvc_show_includes_converts_server_codepage() {
+        use crate::compiler::{msvc_output_codepage, transcode_output};
+
+        let text = "Nota: inclusión del archivo: C:\\dépendances\\value.h\r\n";
+        let expected = transcode_output(text.as_bytes(), 65001, msvc_output_codepage()).unwrap();
+        for codepage in [850, 65001] {
+            let data = transcode_output(text.as_bytes(), 65001, codepage).unwrap();
+            let response = CompileFinished {
+                retcode: Some(0),
+                stdout: data.clone(),
+                stderr: data,
+                color_mode: ColorMode::On,
+                output_codepage: Some(codepage),
+                ..Default::default()
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(
+                handle_compile_finished(response, &mut stdout, &mut stderr).unwrap(),
+                0
+            );
+            assert_eq!(stdout, expected);
+            assert_eq!(stderr, expected);
+        }
     }
 
     /// A `Connection` that immediately returns EOF on reads and discards writes.
