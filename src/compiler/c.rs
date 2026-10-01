@@ -1727,6 +1727,13 @@ mod test {
             .unwrap();
         for (source, header, flags, basedirs, direct) in [
             (
+                "#include \"value.h\"\nint import = 42;\n",
+                "const char *message = \"import\";\n",
+                ovec![],
+                false,
+                true,
+            ),
+            (
                 "#include \"value.h\"\n",
                 "#define VALUE 42\n",
                 ovec![],

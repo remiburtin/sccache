@@ -155,13 +155,42 @@ pub(super) fn direct_mode_file_is_safe(path: &Path) -> bool {
         return false;
     }
     bytes.retain(|byte| !matches!(byte, b'\\' | b'\r' | b'\n'));
-    let identifier_byte = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
-    !bytes.windows(b"import".len()).enumerate().any(|(i, s)| {
-        s == b"import"
-            && (i == 0 || !identifier_byte(&bytes[i - 1]))
-            && !bytes.get(i + s.len()).is_some_and(identifier_byte)
-    }) && !bytes.windows(b"??/".len()).any(|s| s == b"??/")
+    !has_import_directive(&bytes)
+        && !bytes.windows(b"??/".len()).any(|s| s == b"??/")
         && !has_time_macros(&bytes)
+}
+
+fn has_import_directive(bytes: &[u8]) -> bool {
+    (0..bytes.len()).any(|i| {
+        let Some(mut rest) = bytes[i..]
+            .strip_prefix(b"#")
+            .or_else(|| bytes[i..].strip_prefix(b"%:"))
+            .or_else(|| bytes[i..].strip_prefix(b"??="))
+        else {
+            return false;
+        };
+        // Whitespace and comments may separate the # from the directive name.
+        loop {
+            while rest
+                .first()
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'\x0b')
+            {
+                rest = &rest[1..];
+            }
+            let Some(comment) = rest.strip_prefix(b"/*") else {
+                break;
+            };
+            let Some(end) = comment.windows(2).position(|s| s == b"*/") else {
+                return false;
+            };
+            rest = &comment[end + 2..];
+        }
+        rest.strip_prefix(b"import").is_some_and(|after| {
+            !after
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        })
+    })
 }
 
 fn has_time_macros(bytes: &[u8]) -> bool {
@@ -1778,7 +1807,14 @@ mod test {
         assert!(!direct_mode_file_is_safe(&path));
         for contents in [
             b"#import \"test.tlb\"".as_slice(),
+            b"# import \"test.tlb\"",
+            b"  #\timport \"test.tlb\"",
+            b"#\x0b\x0cimport \"test.tlb\"",
             b"# /*comment*/ import \"test.tlb\"",
+            b"#/**/ /* another\ncomment */import \"test.tlb\"",
+            b"#\\\n import \"test.tlb\"",
+            b"%: import \"test.tlb\"",
+            b"??= import \"test.tlb\"",
             b"#im\\\nport \"test.tlb\"",
             b"#im\\\r\nport \"test.tlb\"",
             b"#im??/\nport \"test.tlb\"",
@@ -1791,12 +1827,20 @@ mod test {
             fs::write(&path, contents).unwrap();
             assert!(!direct_mode_file_is_safe(&path), "{contents:?}");
         }
-        fs::write(
-            &path,
-            b"#include \"value.h\"\n__declspec(dllimport) int value();\n",
-        )
-        .unwrap();
-        assert!(direct_mode_file_is_safe(&path));
+        for contents in [
+            b"#include \"value.h\"\n__declspec(dllimport) int value();\n".as_slice(),
+            b"int import = 42;",
+            b"const char *s = \"import\";",
+            b"// import a type library\nint value;",
+            b"/* import a type library */ int value;",
+            b"#define MESSAGE \"import\"",
+            b"#include \"import.h\"",
+            b"#define imported 42",
+            b"const char *s = \"#imported #import_ #import1\";",
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert!(direct_mode_file_is_safe(&path), "{contents:?}");
+        }
     }
 
     #[test]
