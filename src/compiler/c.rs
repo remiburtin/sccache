@@ -1714,84 +1714,29 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_msvc_direct_cache_pipeline() {
-        use crate::cache::{CacheMode, disk::DiskCache};
-        use crate::compiler::msvc::Msvc;
-        use crate::mock_command::{MockChild, exit_status};
-        use crate::test::utils::{new_creator, next_command_calls};
+    struct MsvcTest {
+        dir: tempfile::TempDir,
+        runtime: tokio::runtime::Runtime,
+        storage: Arc<dyn Storage>,
+        creator: Arc<Mutex<crate::mock_command::MockCommandCreator>>,
+    }
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        for (source, header, flags, basedirs, direct) in [
-            (
-                "#include \"value.h\"\nint import = 42;\n",
-                "const char *message = \"import\";\n",
-                ovec![],
-                false,
-                true,
-            ),
-            (
-                "#include \"value.h\"\n",
-                "#define VALUE 42\n",
-                ovec![],
-                false,
-                true,
-            ),
-            (
-                "#include \"value.h\"\n__DATE__\n",
-                "#define VALUE 42\n",
-                ovec![],
-                false,
-                false,
-            ),
-            (
-                "#import \"value.tlb\"\n",
-                "#define VALUE 42\n",
-                ovec![],
-                false,
-                false,
-            ),
-            (
-                "#include \"value.h\"\n",
-                "#import \"value.tlb\"\n",
-                ovec![],
-                false,
-                false,
-            ),
-            (
-                "#include \"value.h\"\n",
-                "#define VALUE 42\n",
-                ovec!["/sourceDependencies", "deps.json"],
-                false,
-                false,
-            ),
-            (
-                "#include \"value.h\"\n",
-                "#define VALUE 42\n",
-                ovec!["/showIncludes"],
-                false,
-                true,
-            ),
-            (
-                "#include \"value.h\"\n",
-                "#define VALUE 42\n",
-                ovec![],
-                true,
-                false,
-            ),
-        ] {
+    impl MsvcTest {
+        fn new(config: PreprocessorCacheModeConfig, basedirs: bool) -> Self {
+            use crate::cache::{CacheMode, disk::DiskCache};
+            use crate::test::utils::{new_creator, single_threaded_runtime};
+
             let dir = tempfile::tempdir().unwrap();
+            let runtime = single_threaded_runtime();
             let cwd = dir.path();
-            fs::write(cwd.join("main.c"), source).unwrap();
-            fs::write(cwd.join("value.h"), header).unwrap();
-            let storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
+            fs::write(cwd.join("cl.exe"), "compiler").unwrap();
+            fs::write(cwd.join("main.c"), "#include \"value.h\"\n").unwrap();
+            fs::write(cwd.join("value.h"), "#define VALUE 42\n").unwrap();
+            let storage = Arc::new(DiskCache::new(
                 cwd.join("cache"),
                 1024 * 1024,
                 runtime.handle(),
-                PreprocessorCacheModeConfig::activated(),
+                config,
                 CacheMode::ReadWrite,
                 if basedirs {
                     vec![cwd.as_os_str().as_encoded_bytes().to_vec()]
@@ -1799,119 +1744,180 @@ mod test {
                     vec![]
                 },
             ));
-            let compiler = Msvc {
-                includes_prefix: "Note: including file: ".into(),
-                is_clang: false,
-                version: None,
-            };
+            Self {
+                dir,
+                runtime,
+                storage,
+                creator: new_creator(),
+            }
+        }
+
+        fn hash(&self, flags: &[OsString], prefix: &str, env: Vec<(OsString, OsString)>) -> String {
+            let cwd = self.dir.path();
+            let compiler = self
+                .runtime
+                .block_on(CCompiler::new(
+                    crate::compiler::msvc::Msvc {
+                        includes_prefix: prefix.into(),
+                        is_clang: false,
+                        version: None,
+                    },
+                    cwd.join("cl.exe"),
+                    self.runtime.handle(),
+                ))
+                .unwrap();
             let mut args = ovec!["/c", "main.c"];
-            args.extend(flags);
-            let CompilerArguments::Ok(parsed_args) = compiler.parse_arguments(&args, cwd, &[])
+            args.extend_from_slice(flags);
+            let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(&args, cwd, &env)
             else {
                 panic!("failed to parse {args:?}");
             };
-            let mut hasher = CCompilerHasher {
-                parsed_args,
-                executable: "cl.exe".into(),
-                executable_digest: "compiler".into(),
-                compiler,
-            };
-            let creator = new_creator();
+            // A direct hit has no queued child, so unexpected preprocessing panics.
+            let key = self
+                .runtime
+                .block_on(hasher.generate_hash_key(
+                    &self.creator,
+                    cwd.to_owned(),
+                    env,
+                    false,
+                    self.runtime.handle(),
+                    false,
+                    self.storage.clone(),
+                    CacheControl::Default,
+                ))
+                .unwrap()
+                .key;
+            assert!(self.creator.lock().unwrap().children.is_empty());
+            key
+        }
+
+        fn preprocess(&self, value: u32) {
+            use crate::mock_command::{MockChild, exit_status};
+            crate::test::utils::next_command_calls(&self.creator, move |args| {
+                assert!(args.iter().any(|arg| arg == "-E" || arg == "-EP"));
+                Ok(MockChild::new(
+                    exit_status(0),
+                    format!("#line 1 \"value.h\"\nint value = {value};\n"),
+                    "",
+                ))
+            });
+        }
+    }
+
+    #[test]
+    fn test_msvc_direct_cache_pipeline() {
+        for (name, source, header, flags, basedirs, direct) in [
+            (
+                "ordinary import tokens",
+                "int import = 42;",
+                "const char *s = \"import\";",
+                ovec![],
+                false,
+                true,
+            ),
+            ("plain", "", "", ovec![], false, true),
+            (
+                "source import",
+                "#import \"value.tlb\"",
+                "",
+                ovec![],
+                false,
+                false,
+            ),
+            (
+                "header import",
+                "",
+                "#import \"value.tlb\"",
+                ovec![],
+                false,
+                false,
+            ),
+            (
+                "dependency file",
+                "",
+                "",
+                ovec!["/sourceDependencies", "deps.json"],
+                false,
+                false,
+            ),
+            (
+                "include output",
+                "",
+                "",
+                ovec!["/showIncludes"],
+                false,
+                true,
+            ),
+            ("basedirs", "", "", ovec![], true, false),
+        ] {
+            let f = MsvcTest::new(PreprocessorCacheModeConfig::activated(), basedirs);
+            fs::write(
+                f.dir.path().join("main.c"),
+                format!("#include \"value.h\"\n{source}\n"),
+            )
+            .unwrap();
             let mut keys = Vec::new();
             for index in 0..4 {
-                if index == 2 {
+                let value = if index < 2 { 42 } else { 43 };
+                if index % 2 == 0 {
                     fs::write(
-                        cwd.join("value.h"),
-                        format!("{header}\n#define CHANGED 43\n"),
+                        f.dir.path().join("value.h"),
+                        format!("{header}\n#define VALUE {value}\n"),
                     )
                     .unwrap();
                 }
                 if !direct || index % 2 == 0 {
-                    next_command_calls(&creator, move |args| {
-                        assert!(args.iter().any(|arg| arg == "-E" || arg == "-EP"));
-                        Ok(MockChild::new(
-                            exit_status(0),
-                            format!(
-                                "#line 1 \"value.h\"\nint value = {};\n",
-                                if index < 2 { 42 } else { 43 }
-                            ),
-                            "",
-                        ))
-                    });
+                    f.preprocess(value);
                 }
-                // Do not queue a process for direct hits: any preprocessing panics.
-                keys.push(
-                    runtime
-                        .block_on(hasher.generate_hash_key(
-                            &creator,
-                            cwd.to_owned(),
-                            vec![],
-                            false,
-                            runtime.handle(),
-                            false,
-                            storage.clone(),
-                            CacheControl::Default,
-                        ))
-                        .unwrap()
-                        .key,
-                );
-                assert!(creator.lock().unwrap().children.is_empty());
+                keys.push(f.hash(&flags, "Note: including file: ", vec![]));
             }
-            assert_eq!(keys[0], keys[1]);
-            assert_eq!(keys[2], keys[3]);
-            assert_ne!(keys[0], keys[2]);
+            assert_eq!(keys[0], keys[1], "{name}");
+            assert_eq!(keys[2], keys[3], "{name}");
+            assert_ne!(keys[0], keys[2], "{name}");
+        }
+    }
+
+    #[test]
+    fn test_msvc_time_macros_disable_direct_hits_even_when_ignored() {
+        for token in ["__TIME__", "__DATE__", "__TIMESTAMP__"] {
+            for file in ["main.c", "value.h"] {
+                for ignore_time_macros in [false, true] {
+                    let f = MsvcTest::new(
+                        PreprocessorCacheModeConfig {
+                            ignore_time_macros,
+                            ..PreprocessorCacheModeConfig::activated()
+                        },
+                        false,
+                    );
+                    let path = f.dir.path().join(file);
+                    let contents = fs::read_to_string(&path).unwrap();
+                    fs::write(path, format!("{contents}{token}\n")).unwrap();
+                    for _ in 0..2 {
+                        f.preprocess(42);
+                        f.hash(&[], "Note: including file: ", vec![]);
+                    }
+                }
+            }
         }
     }
 
     #[test]
     fn test_msvc_show_includes_has_separate_direct_manifest() {
-        use crate::cache::{CacheMode, disk::DiskCache};
-        use crate::compiler::msvc::Msvc;
         use crate::mock_command::{MockChild, exit_status};
-        use crate::test::utils::{new_creator, next_command_calls};
+        use crate::test::utils::next_command_calls;
 
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         for show_includes_first in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let cwd = dir.path();
-            fs::write(cwd.join("main.c"), "#include \"value.h\"\n").unwrap();
-            fs::write(cwd.join("value.h"), "#define VALUE 42\n").unwrap();
-            let storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
-                cwd.join("cache"),
-                1024 * 1024,
-                runtime.handle(),
-                PreprocessorCacheModeConfig::activated(),
-                CacheMode::ReadWrite,
-                vec![],
-            ));
-            let creator = new_creator();
+            let f = MsvcTest::new(PreprocessorCacheModeConfig::activated(), false);
             let mut keys = Vec::new();
             for index in 0..4 {
                 let show_includes = (index % 2 == 0) == show_includes_first;
-                let compiler = Msvc {
-                    includes_prefix: "Note: including file: ".into(),
-                    is_clang: false,
-                    version: None,
-                };
-                let mut args = ovec!["/c", "main.c"];
-                if show_includes {
-                    args.push("/showIncludes".into());
-                }
-                let CompilerArguments::Ok(parsed_args) = compiler.parse_arguments(&args, cwd, &[])
-                else {
-                    panic!("failed to parse {args:?}");
-                };
-                let mut hasher = CCompilerHasher {
-                    parsed_args,
-                    executable: "cl.exe".into(),
-                    executable_digest: "compiler".into(),
-                    compiler,
+                let flags = if show_includes {
+                    ovec!["/showIncludes"]
+                } else {
+                    ovec![]
                 };
                 if index < 2 {
-                    next_command_calls(&creator, move |args| {
+                    next_command_calls(&f.creator, move |args| {
                         assert!(args.iter().any(|arg| arg == "-E"));
                         assert_eq!(args.iter().any(|arg| arg == "/showIncludes"), show_includes);
                         Ok(MockChild::new(
@@ -1921,25 +1927,12 @@ mod test {
                         ))
                     });
                 }
-                // Both variants must preprocess once, then hit their own manifest.
-                keys.push(
-                    runtime
-                        .block_on(hasher.generate_hash_key(
-                            &creator,
-                            cwd.to_owned(),
-                            vec![],
-                            false,
-                            runtime.handle(),
-                            false,
-                            storage.clone(),
-                            CacheControl::Default,
-                        ))
-                        .unwrap()
-                        .key,
-                );
-                assert!(creator.lock().unwrap().children.is_empty());
+                keys.push(f.hash(&flags, "Note: including file: ", vec![]));
             }
-            assert_ne!(keys[0], keys[1]);
+            assert_ne!(
+                keys[0], keys[1],
+                "showIncludes first: {show_includes_first}"
+            );
             assert_eq!(keys[0], keys[2]);
             assert_eq!(keys[1], keys[3]);
         }
@@ -1947,15 +1940,6 @@ mod test {
 
     #[test]
     fn test_msvc_output_locale_separates_cache_entries() {
-        use crate::cache::{CacheMode, disk::DiskCache};
-        use crate::compiler::msvc::Msvc;
-        use crate::mock_command::{MockChild, exit_status};
-        use crate::test::utils::{new_creator, next_command_calls};
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let variants = [
             ("Note: including file: ", None),
             ("Remarque : inclusion du fichier : ", None),
@@ -1964,27 +1948,17 @@ mod test {
             ("Note: including file: ", Some("")),
         ];
         for direct in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let cwd = dir.path();
-            fs::write(cwd.join("cl.exe"), "compiler").unwrap();
-            fs::write(cwd.join("main.c"), "#include \"value.h\"\n").unwrap();
-            fs::write(cwd.join("value.h"), "#define VALUE 42\n").unwrap();
-            let storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
-                cwd.join("cache"),
-                1024 * 1024,
-                runtime.handle(),
+            let f = MsvcTest::new(
                 PreprocessorCacheModeConfig {
                     use_preprocessor_cache_mode: direct,
                     ..PreprocessorCacheModeConfig::activated()
                 },
-                CacheMode::ReadWrite,
-                vec![],
-            ));
-            let creator = new_creator();
+                false,
+            );
             let mut keys = Vec::new();
             for pass in 0..2 {
                 for (prefix, vs_lang) in variants {
-                    let env_vars: Vec<_> = vs_lang
+                    let env = vs_lang
                         .map(|value| {
                             let name = if cfg!(windows) && pass == 1 {
                                 "vSlAnG"
@@ -1995,52 +1969,17 @@ mod test {
                         })
                         .into_iter()
                         .collect();
-                    let compiler = runtime
-                        .block_on(CCompiler::new(
-                            Msvc {
-                                includes_prefix: prefix.into(),
-                                is_clang: false,
-                                version: None,
-                            },
-                            cwd.join("cl.exe"),
-                            runtime.handle(),
-                        ))
-                        .unwrap();
-                    let CompilerArguments::Ok(mut hasher) = compiler.parse_arguments(
-                        &["/c".into(), "/showIncludes".into(), "main.c".into()],
-                        cwd,
-                        &env_vars,
-                    ) else {
-                        panic!("failed to parse MSVC arguments");
-                    };
                     if pass == 0 || !direct {
-                        next_command_calls(&creator, |_| {
-                            Ok(MockChild::new(
-                                exit_status(0),
-                                "#line 1 \"value.h\"\nint value = 42;\n",
-                                "",
-                            ))
-                        });
+                        f.preprocess(42);
                     }
-                    keys.push(
-                        runtime
-                            .block_on(hasher.generate_hash_key(
-                                &creator,
-                                cwd.to_owned(),
-                                env_vars,
-                                false,
-                                runtime.handle(),
-                                false,
-                                storage.clone(),
-                                CacheControl::Default,
-                            ))
-                            .unwrap()
-                            .key,
-                    );
-                    assert!(creator.lock().unwrap().children.is_empty());
+                    keys.push(f.hash(&["/showIncludes".into()], prefix, env));
                 }
             }
-            assert_eq!(&keys[..variants.len()], &keys[variants.len()..]);
+            assert_eq!(
+                &keys[..variants.len()],
+                &keys[variants.len()..],
+                "direct: {direct}"
+            );
             assert_eq!(keys.iter().collect::<HashSet<_>>().len(), variants.len());
         }
     }
@@ -2449,7 +2388,7 @@ int value;
     fn test_process_preprocessed_file_msvc_e() {
         let cwd = Path::new(r"D:\a\sccache\sccache\evidence\server");
         let header = cwd.join("value.h");
-        let contents = &include_bytes!("../../tests/integration/msvc-direct/value.h")[..];
+        let contents = &include_bytes!("../../tests/integration/msvc-preprocessing/value.h")[..];
         let fs_impl = TestFs {
             metadata_results: Mutex::new(
                 [(
@@ -2470,7 +2409,8 @@ int value;
                     .collect(),
             ),
         };
-        let original = include_bytes!("../../tests/integration/msvc-direct/msvc-19.44-E.stdout");
+        let original =
+            include_bytes!("../../tests/integration/msvc-preprocessing/msvc-19.44-E.stdout");
         let mut bytes = original.to_vec();
         let mut include_files = HashMap::new();
         assert!(
@@ -2495,7 +2435,8 @@ int value;
 
     #[test]
     fn test_process_preprocessed_file_msvc_ep() {
-        let original = include_bytes!("../../tests/integration/msvc-direct/msvc-19.44-EP.stdout");
+        let original =
+            include_bytes!("../../tests/integration/msvc-preprocessing/msvc-19.44-EP.stdout");
         let mut bytes = original.to_vec();
         let mut include_files = HashMap::new();
         assert!(

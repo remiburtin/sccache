@@ -1676,36 +1676,39 @@ mod test {
         for is_clang in [false, true] {
             for direct in [false, true] {
                 for may_dist in [false, true] {
-                    let CompilerArguments::Ok(parsed) = super::parse_arguments(
-                        &["/c".into(), "foo.c".into()],
-                        Path::new(""),
-                        is_clang,
-                    ) else {
-                        panic!("failed to parse arguments");
-                    };
-                    let mut cmd = MockCommand {
-                        child: None,
-                        args: vec![],
-                    };
-                    preprocess_cmd(
-                        &mut cmd,
-                        &parsed,
-                        Path::new(""),
-                        &[],
-                        may_dist,
-                        false,
-                        is_clang,
-                        direct,
-                    );
-                    assert_eq!(
-                        cmd.args[0],
-                        if may_dist || (direct && !is_clang) {
-                            "-E"
-                        } else {
-                            "-EP"
-                        }
-                    );
-                    assert_eq!(cmd.args.last().unwrap(), "foo.c");
+                    for profile_generate in [false, true] {
+                        let CompilerArguments::Ok(mut parsed) = super::parse_arguments(
+                            &["/c".into(), "foo.c".into()],
+                            Path::new(""),
+                            is_clang,
+                        ) else {
+                            panic!("failed to parse arguments");
+                        };
+                        parsed.profile_generate = profile_generate;
+                        let mut cmd = MockCommand {
+                            child: None,
+                            args: vec![],
+                        };
+                        preprocess_cmd(
+                            &mut cmd,
+                            &parsed,
+                            Path::new(""),
+                            &[],
+                            may_dist,
+                            false,
+                            is_clang,
+                            direct,
+                        );
+                        assert_eq!(
+                            cmd.args[0],
+                            if may_dist || profile_generate || (direct && !is_clang) {
+                                "-E"
+                            } else {
+                                "-EP"
+                            }
+                        );
+                        assert_eq!(cmd.args.last().unwrap(), "foo.c");
+                    }
                 }
             }
         }

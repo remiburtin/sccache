@@ -2218,3 +2218,582 @@ fn test_symlinked_exe() {
         fs::remove_file(&sccache_compiler_alias).unwrap();
     }
 }
+
+#[cfg(target_env = "msvc")]
+mod msvc_direct {
+    use super::*;
+    use std::os::windows::fs::FileTimesExt;
+    use test_case::test_case;
+    use windows_sys::Win32::System::Console::{GetConsoleOutputCP, SetConsoleOutputCP};
+
+    const SOURCE: &str = "#include \"value.h\"\nint value() { return VALUE; }\n";
+
+    struct MsvcSession {
+        dir: tempfile::TempDir,
+        compiler: OsString,
+        env: HashMap<OsString, OsString>,
+        client_side: bool,
+        started: bool,
+    }
+
+    impl MsvcSession {
+        fn new(client_side: bool, direct: bool, basedirs: bool) -> Self {
+            let compiler = find_compilers().remove(0);
+            let dir = tempfile::tempdir().unwrap();
+            let mut env: HashMap<OsString, OsString> = env::vars_os()
+                .chain(compiler.env_vars)
+                .map(|(key, value)| (key.to_string_lossy().to_ascii_uppercase().into(), value))
+                .collect();
+            env.retain(|key, _| {
+                let key = key.to_string_lossy().to_ascii_uppercase();
+                !key.starts_with("SCCACHE_") && !matches!(key.as_str(), "CL" | "_CL_" | "VSLANG")
+            });
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            env.insert(
+                "SCCACHE_SERVER_PORT".into(),
+                listener.local_addr().unwrap().port().to_string().into(),
+            );
+            env.insert(
+                "SCCACHE_CLIENT_SIDE".into(),
+                if client_side { "1" } else { "0" }.into(),
+            );
+            let mut config = sccache_client_cfg(dir.path(), direct);
+            if basedirs {
+                config.basedirs = ["tree one", "tree two"]
+                    .map(|name| dir.path().join(name).to_str().unwrap().to_owned())
+                    .to_vec();
+            }
+            write_json_cfg(dir.path(), "config.json", &config);
+            env.insert("SCCACHE_CONF".into(), dir.path().join("config.json").into());
+            env.insert(
+                "SCCACHE_CACHED_CONF".into(),
+                dir.path().join("cached-config").into(),
+            );
+            let session = Self {
+                dir,
+                compiler: compiler.exe,
+                env,
+                client_side,
+                started: false,
+            };
+            for tree in ["tree one", "tree two"] {
+                session.write(&format!("{tree}/main.cpp"), SOURCE);
+                session.write(&format!("{tree}/value.h"), "#define VALUE 42\n");
+                session.write(&format!("{tree}/forced.h"), "#define FORCED 42\n");
+            }
+            session
+        }
+
+        fn write(&self, path: &str, contents: &str) {
+            let path = self.dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, contents).unwrap();
+            // Backdate creation as well as modification: direct mode checks both on Windows.
+            let time = SystemTime::now() - Duration::from_secs(10);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_created(time)
+                        .set_modified(time),
+                )
+                .unwrap();
+        }
+
+        fn command(&self) -> Command {
+            let mut command = sccache_command();
+            command.env_clear().envs(&self.env);
+            command
+        }
+
+        fn start(&mut self) {
+            let mut command = self.command();
+            command.arg("--start-server");
+            if !self.client_side {
+                command
+                    .env("SCCACHE_LOG", "sccache=debug")
+                    .env("SCCACHE_ERROR_LOG", self.dir.path().join("server.log"));
+            }
+            // wait_with_output can hang on Windows when a daemon inherits the pipe.
+            assert!(command.stdout(Stdio::null()).status().unwrap().success());
+            self.started = true;
+        }
+
+        fn stats(&self, hits: u64, misses: u64) {
+            let output = self
+                .command()
+                .args(["--show-stats", "--stats-format=json"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let info: sccache::server::ServerInfo = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(info.stats.cache_hits.all(), hits);
+            assert_eq!(info.stats.cache_misses.all(), misses);
+        }
+
+        fn compile(
+            &self,
+            tree: &str,
+            flags: &[OsString],
+            direct: bool,
+            bypass: bool,
+            compare_object: bool,
+        ) -> (Vec<u8>, Output) {
+            let cwd = self.dir.path().join(tree);
+            for file in ["main.obj", "deps.json"] {
+                let path = cwd.join(file);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            let log_path = self.dir.path().join("server.log");
+            let before = if self.client_side {
+                0
+            } else {
+                fs::metadata(&log_path).unwrap().len() as usize
+            };
+            let output = self
+                .command()
+                .arg(&self.compiler)
+                .args(flags)
+                .current_dir(&cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{flags:?}: {output:?}");
+            let object = fs::read(cwd.join("main.obj")).unwrap();
+            assert!(!object.is_empty());
+            if !self.client_side {
+                let log = fs::read(&log_path).unwrap();
+                let log = String::from_utf8_lossy(&log[before..]);
+                assert_eq!(
+                    log.matches("Preprocessor cache hit:").count(),
+                    usize::from(direct),
+                    "{log}"
+                );
+                assert_eq!(
+                    log.lines()
+                        .filter(|line| line.contains("sccache::compiler::msvc")
+                            && line.contains("preprocess: "))
+                        .count(),
+                    usize::from(!direct && !bypass),
+                    "{log}"
+                );
+            }
+            if flags.iter().any(|flag| flag == "/sourceDependencies") {
+                let deps: serde_json::Value =
+                    serde_json::from_slice(&fs::read(cwd.join("deps.json")).unwrap()).unwrap();
+                assert!(
+                    deps["Data"]["Includes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|path| path.as_str().unwrap().ends_with("value.h"))
+                );
+            }
+            // Read cached artifacts first so the native invocation cannot repair them.
+            fs::remove_file(cwd.join("main.obj")).unwrap();
+            let reference = Command::new(&self.compiler)
+                .env_clear()
+                .envs(&self.env)
+                .args(flags)
+                .current_dir(&cwd)
+                .output()
+                .unwrap();
+            assert!(reference.status.success(), "{reference:?}");
+            if compare_object {
+                assert_eq!(
+                    object,
+                    fs::read(cwd.join("main.obj")).unwrap(),
+                    "object differs from native compiler"
+                );
+            }
+            let show_includes = flags.iter().any(|flag| flag == "/showIncludes");
+            for (actual, expected) in [
+                (&output.stdout, &reference.stdout),
+                (&output.stderr, &reference.stderr),
+            ] {
+                let expected = if show_includes || bypass {
+                    expected.clone()
+                } else {
+                    // Ordinary cached output passes through the ANSI filter, which normalizes CRLF.
+                    expected
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &byte)| {
+                            (byte != b'\r' || expected.get(i + 1) != Some(&b'\n')).then_some(byte)
+                        })
+                        .collect()
+                };
+                assert_eq!(
+                    *actual, expected,
+                    "compiler output differs from native compiler"
+                );
+            }
+            (object, output)
+        }
+    }
+
+    impl Drop for MsvcSession {
+        fn drop(&mut self) {
+            if self.started {
+                let _ = self
+                    .command()
+                    .arg("--stop-server")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    fn flags() -> Vec<OsString> {
+        ["/nologo", "/c", "/Brepro", "main.cpp", "/Fomain.obj"]
+            .map(OsString::from)
+            .to_vec()
+    }
+
+    #[test_case(false; "server")]
+    #[test_case(true; "client")]
+    #[serial]
+    fn cache_lifecycle(client_side: bool) {
+        let mut session = MsvcSession::new(client_side, true, false);
+        session.start();
+        let mut objects = Vec::new();
+        for index in 0_u64..4 {
+            if index == 2 {
+                session.write("tree one/value.h", "#define VALUE 43\n");
+            }
+            objects.push(
+                session
+                    .compile("tree one", &flags(), index % 2 == 1, false, true)
+                    .0,
+            );
+            session.stats(index.div_ceil(2), index / 2 + 1);
+        }
+        assert_eq!(objects[0], objects[1]);
+        assert_ne!(objects[0], objects[2]);
+        assert_eq!(objects[2], objects[3]);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Input {
+        Defines,
+        Undefine,
+        ForcedInclude,
+        IncludeEnv,
+        ClEnv,
+        SuffixClEnv,
+        AbsolutePaths,
+        Basedirs,
+        Dependencies,
+        Header,
+        Clang,
+    }
+
+    #[test_case(Input::Defines, false; "defines")]
+    #[test_case(Input::Undefine, false; "undefine")]
+    #[test_case(Input::ForcedInclude, false; "forced include")]
+    #[test_case(Input::IncludeEnv, false; "include environment")]
+    #[test_case(Input::ClEnv, false; "CL environment")]
+    #[test_case(Input::SuffixClEnv, false; "suffix CL environment")]
+    #[test_case(Input::AbsolutePaths, false; "absolute paths with spaces")]
+    #[test_case(Input::Basedirs, false; "relocated checkout")]
+    #[test_case(Input::Dependencies, false; "dependency file regeneration")]
+    #[test_case(Input::Clang, false; "clang cl fallback")]
+    #[test_case(Input::Header, true; "showIncludes header")]
+    #[test_case(Input::ForcedInclude, true; "showIncludes forced include")]
+    #[test_case(Input::IncludeEnv, true; "showIncludes include environment")]
+    #[serial]
+    fn input_changes(input: Input, show_includes: bool) {
+        let mut session = MsvcSession::new(false, true, matches!(input, Input::Basedirs));
+        match input {
+            Input::Defines | Input::ClEnv | Input::SuffixClEnv => session.write("tree one/main.cpp", "#include \"value.h\"\nint value() { return SELECT; }\n"),
+            Input::Undefine => session.write("tree one/main.cpp", "#include \"value.h\"\n#ifndef SELECT\n#define SELECT 43\n#endif\nint value() { return SELECT; }\n"),
+            Input::ForcedInclude => session.write("tree one/main.cpp", "int value() { return FORCED; }\n"),
+            Input::IncludeEnv => {
+                session.write("tree one/main.cpp", "#include <value.h>\nint value() { return VALUE; }\n");
+                session.write("include one/value.h", "#define VALUE 42\n");
+                session.write("include two/value.h", "#define VALUE 43\n");
+            }
+            Input::Basedirs => session.write("tree two/value.h", "#define VALUE 43\n"),
+            Input::Clang => {
+                session.compiler = which("clang-cl.exe").expect("clang-cl.exe is required").into();
+            }
+            _ => {}
+        }
+        let original_include = session
+            .env
+            .get(OsStr::new("INCLUDE"))
+            .cloned()
+            .unwrap_or_default();
+        session.start();
+        let mut objects = Vec::new();
+        for index in 0_u64..4 {
+            let changed = index >= 2;
+            let value = if changed { 43 } else { 42 };
+            let tree = if changed && matches!(input, Input::Basedirs) {
+                "tree two"
+            } else {
+                "tree one"
+            };
+            let mut args = flags();
+            match input {
+                Input::Defines => args.push(format!("/DSELECT={value}").into()),
+                Input::Undefine => {
+                    args.push("/DSELECT=42".into());
+                    if changed {
+                        args.push("/USELECT".into());
+                    }
+                }
+                Input::ForcedInclude => args.push(
+                    format!(
+                        "/FI{}",
+                        session.dir.path().join(tree).join("forced.h").display()
+                    )
+                    .into(),
+                ),
+                Input::IncludeEnv => {
+                    let mut include = session
+                        .dir
+                        .path()
+                        .join(if changed {
+                            "include two"
+                        } else {
+                            "include one"
+                        })
+                        .into_os_string();
+                    include.push(";");
+                    include.push(&original_include);
+                    session.env.insert("INCLUDE".into(), include);
+                }
+                Input::ClEnv | Input::SuffixClEnv => {
+                    session.env.insert(
+                        if matches!(input, Input::ClEnv) {
+                            "CL"
+                        } else {
+                            "_CL_"
+                        }
+                        .into(),
+                        format!("/DSELECT#{value}").into(),
+                    );
+                }
+                Input::AbsolutePaths => {
+                    let cwd = session.dir.path().join(tree);
+                    args[3] = cwd.join("main.cpp").into();
+                    args[4] = format!("/Fo{}", cwd.join("main.obj").display()).into();
+                    args.push(format!("/I{}", cwd.display()).into());
+                }
+                Input::Dependencies => {
+                    args.extend(["/sourceDependencies".into(), "deps.json".into()]);
+                }
+                _ => {}
+            }
+            if index == 2 {
+                match input {
+                    Input::ForcedInclude => {
+                        session.write("tree one/forced.h", "#define FORCED 43\n");
+                    }
+                    Input::Header | Input::AbsolutePaths | Input::Dependencies | Input::Clang => {
+                        session.write("tree one/value.h", "#define VALUE 43\n");
+                    }
+                    _ => {}
+                }
+            }
+            if show_includes {
+                args.push("/showIncludes".into());
+            }
+            let bypass = matches!(input, Input::ClEnv | Input::SuffixClEnv);
+            let direct = index % 2 == 1
+                && !bypass
+                && !matches!(input, Input::Basedirs | Input::Dependencies | Input::Clang);
+            let (object, output) = session.compile(tree, &args, direct, bypass, true);
+            if show_includes {
+                let output = [output.stdout, output.stderr].concat();
+                let header = if matches!(input, Input::ForcedInclude) {
+                    "forced.h"
+                } else {
+                    "value.h"
+                };
+                assert!(
+                    output
+                        .windows(header.len())
+                        .any(|bytes| bytes == header.as_bytes())
+                );
+            }
+            objects.push(object);
+            if !bypass {
+                session.stats(index.div_ceil(2), index / 2 + 1);
+            }
+        }
+        assert_eq!(objects[0], objects[1], "{input:?}");
+        assert_ne!(objects[0], objects[2], "{input:?}");
+        assert_eq!(objects[2], objects[3], "{input:?}");
+    }
+
+    #[test_case("__DATE__", false; "source date")]
+    #[test_case("__TIME__", false; "source time")]
+    #[test_case("__TIMESTAMP__", false; "source timestamp")]
+    #[test_case("__TIME__", true; "header time")]
+    #[test_case("import", false; "source import")]
+    #[test_case("import", true; "header import")]
+    #[serial]
+    fn unsafe_inputs(token: &str, header: bool) {
+        let mut session = MsvcSession::new(false, true, false);
+        let suffix = if token == "import" {
+            "#if 0\n#import \"untracked.tlb\"\n#endif\n".to_owned()
+        } else {
+            format!("const char *stamp = {token};\n")
+        };
+        if !header {
+            session.write("tree one/main.cpp", &format!("{SOURCE}{suffix}"));
+        }
+        session.write(
+            "tree one/value.h",
+            &format!("#define VALUE 42\n{}", if header { &suffix } else { "" }),
+        );
+        session.start();
+        for index in 0..4 {
+            if index == 2 {
+                session.write(
+                    "tree one/value.h",
+                    &format!("#define VALUE 43\n{}", if header { &suffix } else { "" }),
+                );
+            }
+            session.compile("tree one", &flags(), false, false, token == "import");
+        }
+    }
+
+    #[test_case(false; "plain first")]
+    #[test_case(true; "showIncludes first")]
+    #[serial]
+    fn show_includes_separate_entries(first: bool) {
+        let mut session = MsvcSession::new(false, true, false);
+        session.start();
+        let mut outputs = Vec::new();
+        for index in 0_u64..4 {
+            let show = (index % 2 == 0) == first;
+            let mut args = flags();
+            if show {
+                args.push("/showIncludes".into());
+            }
+            let (_, output) = session.compile("tree one", &args, index >= 2, false, true);
+            assert_eq!(
+                [&output.stdout[..], &output.stderr[..]]
+                    .concat()
+                    .windows(7)
+                    .any(|s| s == b"value.h"),
+                show
+            );
+            outputs.push((output.stdout, output.stderr));
+            session.stats(index.saturating_sub(1), (index + 1).min(2));
+        }
+        assert_eq!(outputs[0], outputs[2]);
+        assert_eq!(outputs[1], outputs[3]);
+    }
+
+    struct ConsoleCodepage(u32);
+
+    impl ConsoleCodepage {
+        fn new() -> Self {
+            let original = unsafe { GetConsoleOutputCP() };
+            assert_ne!(original, 0, "localized MSVC tests require a console");
+            Self(original)
+        }
+
+        fn set(&self, codepage: u32) {
+            assert_ne!(
+                unsafe { SetConsoleOutputCP(codepage) },
+                0,
+                "cannot set console code page {codepage}"
+            );
+        }
+    }
+
+    impl Drop for ConsoleCodepage {
+        fn drop(&mut self) {
+            unsafe {
+                SetConsoleOutputCP(self.0);
+            }
+        }
+    }
+
+    #[test_case(false, false, false, true; "language")]
+    #[test_case(false, true, false, true; "language reversed")]
+    #[test_case(false, false, true, true; "unset client language")]
+    #[test_case(false, false, false, false; "language without direct mode")]
+    #[test_case(true, false, false, true; "code page")]
+    #[test_case(true, true, false, true; "code page reversed")]
+    #[test_case(true, false, false, false; "code page without direct mode")]
+    #[ignore = "requires Spanish MSVC resources and a Windows console"]
+    #[serial]
+    fn msvc_localized_show_includes(
+        codepage: bool,
+        reversed: bool,
+        default_language: bool,
+        direct: bool,
+    ) {
+        let console = ConsoleCodepage::new();
+        let mut session = MsvcSession::new(false, direct, false);
+        session.env.insert("VSLANG".into(), "3082".into());
+        session.start();
+        let mut args = flags();
+        args.push("/showIncludes".into());
+        let mut outputs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut objects = Vec::new();
+        for index in 0..4 {
+            let variant = (index % 2) ^ usize::from(reversed);
+            let language = if codepage {
+                Some("3082")
+            } else if default_language {
+                if index % 2 == 0 {
+                    None
+                } else if outputs[0]
+                    .0
+                    .windows(21)
+                    .chain(outputs[0].1.windows(21))
+                    .any(|s| s == b"Note: including file:")
+                {
+                    Some("3082")
+                } else {
+                    Some("1033")
+                }
+            } else {
+                Some(["1033", "3082"][variant])
+            };
+            if let Some(language) = language {
+                session.env.insert("VSLANG".into(), language.into());
+            } else {
+                session.env.remove(OsStr::new("VSLANG"));
+            }
+            if codepage {
+                console.set([65001, 850][variant]);
+            }
+            let warm = index >= if codepage { 1 } else { 2 };
+            let (object, output) = session.compile("tree one", &args, direct && warm, false, true);
+            if language == Some("3082") {
+                assert!(
+                    [&output.stdout[..], &output.stderr[..]]
+                        .concat()
+                        .split(|&b| b == b'\n')
+                        .any(|line| line.windows(7).any(|s| s == b"value.h")
+                            && line.iter().any(|&b| b >= 128)),
+                    "Spanish include prefix missing"
+                );
+            }
+            objects.push(object);
+            outputs.push((output.stdout, output.stderr));
+            let hits = if codepage {
+                index
+            } else {
+                index.saturating_sub(1)
+            } as u64;
+            session.stats(hits, index as u64 + 1 - hits);
+        }
+        assert!(objects.iter().all(|object| object == &objects[0]));
+        assert_ne!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
+        assert_eq!(outputs[1], outputs[3]);
+    }
+}

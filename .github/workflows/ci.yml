@@ -210,6 +210,25 @@ jobs:
           RUSTC_WRAPPER: ""
           RUSTFLAGS: "-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Coverflow-checks=off"
 
+      - name: Install Spanish MSVC resources
+        if: ${{ runner.os == 'Windows' && matrix.rustc == '1.91.0' }}
+        shell: pwsh
+        run: |
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $installPath = & "$installerDir\vswhere.exe" -latest -products '*' -property installationPath
+          if (-not $installPath) { throw 'Visual Studio installation not found' }
+          $arguments = @('modify', '--installPath', "`"$installPath`"", '--addProductLang', 'es-ES', '--quiet', '--norestart')
+          $process = Start-Process -FilePath "$installerDir\setup.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) { throw "Language pack installation failed: $($process.ExitCode)" }
+
+      - name: Test localized MSVC include output
+        if: ${{ runner.os == 'Windows' && matrix.rustc == '1.91.0' }}
+        run: cargo test --locked --test system msvc_localized_show_includes -- --ignored
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTC_WRAPPER: ""
+          RUSTFLAGS: "-Cinstrument-coverage -Ccodegen-units=1 -Copt-level=0 -Coverflow-checks=off"
+
       - name: Upload failure
         if: failure()
         uses: ./.github/actions/artifact_failure

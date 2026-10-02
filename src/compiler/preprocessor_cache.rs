@@ -507,6 +507,19 @@ mod test {
     use super::*;
 
     #[test]
+    fn test_reject_obsolete_manifest_version() {
+        let entry = PreprocessorCacheEntry::new();
+        let mut bytes = Vec::new();
+        entry.serialize_to(&mut bytes).unwrap();
+        assert_eq!(PreprocessorCacheEntry::read(&bytes).unwrap(), entry);
+        bytes[0] = 1;
+        assert!(matches!(
+            PreprocessorCacheEntry::read(&bytes),
+            Err(Error::UnknownFormat(1))
+        ));
+    }
+
+    #[test]
     fn test_direct_key_environment() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.c");
